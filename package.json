@@ -1,16 +1,16 @@
 {
-  "name": "band-aljesi-bot",
+  "name": "bot-aljesi",
   "version": "1.0.0",
-  "description": "BAND Aljesi WhatsApp Bot",
+  "description": "BOT ALJESI WhatsApp Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "20.x"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.0",
+    "@whiskeysockets/baileys": "^6.7.9",
     "pino": "^8.19.0"
   }
 }
