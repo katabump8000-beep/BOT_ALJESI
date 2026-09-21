@@ -2,6 +2,7 @@
   "name": "bot-aljesi",
   "version": "1.0.0",
   "description": "BOT ALJESI WhatsApp Bot",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -10,7 +11,7 @@
     "node": "20.x"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.7",
+    "@whiskeysockets/baileys": "^6.7.9",
     "pino": "^8.19.0"
   }
 }
