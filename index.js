@@ -21,15 +21,13 @@ const __dirname = path.dirname(__filename);
 // Imports
 // ============================================================
 
-import baileys from "@whiskeysockets/baileys";
-import P from "pino";
-
-const makeWASocket = baileys.default || baileys;
-const {
+import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion
-} = baileys;
+} from "@whiskeysockets/baileys";
+
+import P from "pino";
 
 import {
     getOnNotification,
