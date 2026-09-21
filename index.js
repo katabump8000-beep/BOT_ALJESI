@@ -1,7 +1,24 @@
 // index.js - الملف الرئيسي المطور والمعالج بالكامل
-// + LogGuard + Watchdog + تنظيف تلقائي + حماية الإشراف
+// + LogGuard + Watchdog + تنظيف تلقائي + حماية الإشراف + crypto polyfill
 
 "use strict";
+
+// ============================================================
+// 🔐 Crypto Polyfill (حل مشكلة crypto is not defined)
+// ============================================================
+
+if (typeof globalThis.crypto === "undefined") {
+    try {
+        const nodeCrypto = require("crypto");
+        if (nodeCrypto.webcrypto) {
+            globalThis.crypto = nodeCrypto.webcrypto;
+        } else {
+            globalThis.crypto = nodeCrypto;
+        }
+    } catch (e) {
+        console.error("⚠️ فشل تحميل crypto polyfill");
+    }
+}
 
 // ============================================================
 // 🛡️ LogGuard
@@ -436,22 +453,14 @@ async function startBot() {
                     const authorNum = cleanNumber(author.split("@")[0]);
                     const isOwnerAuthor = getOwnerNumbers().includes(authorNum) || author === botNumber;
 
-                    // 🛡️ حماية الإشراف المؤقت (أولوية قصوى)
+                    // 🛡️ حماية الإشراف المؤقت
                     if (isProtectedAdmin(jid, author) && !isOwnerAuthor) {
                         try {
-                            // 1. إعادة العضو المفصول
                             await sock.groupParticipantsUpdate(jid, [target], "add").catch(() => {});
-
-                            // 2. سحب رتبة المشرف المخالف
                             await sock.groupParticipantsUpdate(jid, [author], "demote").catch(() => {});
-
-                            // 3. قفل القروب
                             await sock.groupSettingUpdate(jid, "announcement").catch(() => {});
-
-                            // 4. إزالة الحماية عنه
                             removeProtectedAdmin(jid, author);
 
-                            // 5. إرسال التحذير
                             const authorTag = `@${authorNum}`;
                             const targetTag = `@${cleanNumber(target.split("@")[0])}`;
                             await sock.sendMessage(jid, {
@@ -469,11 +478,10 @@ async function startBot() {
                                     `📉 تم سحب رتبة الإشراف من المخالف\n` +
                                     `🔒 تم قفل القروب لمدة 3 دقائق\n` +
                                     `${DECOR.sepStar}\n` +
-                                    `┊亗 〘 *بوت الإمبراطور باتشيرا* 〙 亗┊`,
+                                    `┊亗 〘 *بوت الإمبراطور آلَجَيـــــــّيسي* 〙 亗┊`,
                                 mentions: [author, target]
                             }).catch(() => {});
 
-                            // 6. فتح القروب بعد 3 دقائق
                             setTimeout(async () => {
                                 try {
                                     await sock.groupSettingUpdate(jid, "not_announcement");
@@ -568,7 +576,6 @@ async function handleIncomingMessage(sock, msg) {
     const mText = getMessageText(msg);
     const mContent = msg.message;
 
-    // ضبط إعدادات القروب
     if (!db.groupSettings[jid]) {
         db.groupSettings[jid] = DEFAULT_SETTINGS_JID();
     }
@@ -580,7 +587,6 @@ async function handleIncomingMessage(sock, msg) {
         settingsJid.filters = { link: true, badword: true, image: true, sticker: true, lang: true, emoji: true };
     }
 
-    // ✅ حساب الصلاحيات أولاً
     const senderNum = cleanNumber(sender.split("@")[0]);
     const ownerNumbers = getOwnerNumbers();
     const isOwner =
@@ -591,7 +597,6 @@ async function handleIncomingMessage(sock, msg) {
     const hasGlobalAccess = isOwner || (db.globalAuthorized && db.globalAuthorized[sender]);
     const hasLocalAccess = hasGlobalAccess || (db.authorizedUsers?.[jid]?.[sender]);
 
-    // ✅ تتبع فقط رسائل الأعضاء العاديين
     if (isGroup && !msg.key.fromMe && !isOwner && !hasLocalAccess) {
         trackMessage(jid, sender, msg.key);
     }
@@ -921,7 +926,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 8. اشرافه 🛡️
+    // 8. اشرافه
     if (command === "اشرافه" || command === "إشرافه") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) {
@@ -1170,7 +1175,7 @@ async function handleCommands(ctx) {
 async function main() {
     try {
         _originalLog("╔════════════════════════════════════╗");
-        _originalLog("║     🤖 BOT PATHIRA START           ║");
+        _originalLog("║   🤖 BOT ALJESI START              ║");
         _originalLog("╚════════════════════════════════════╝");
 
         if (cleanupInterval) clearInterval(cleanupInterval);
