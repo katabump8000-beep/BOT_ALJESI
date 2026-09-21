@@ -1,8 +1,6 @@
-// haolk.js - حماية جهات الاتصال والتعامل مع المغادرين (مزخرف)
+// haolk.js - حماية جهات الاتصال والتعامل مع المغادرين (ESM)
 
-"use strict";
-
-const { DECOR, decorateSuccess, decorateLock } = require("./decor");
+import { DECOR, decorateLock } from "./decor.js";
 
 const recentMessages = {};
 const MAX_MESSAGES_PER_GROUP = 50;
@@ -121,7 +119,7 @@ async function handleAntiLeaveZzs(sock, update) {
     }
 }
 
-module.exports = {
+export {
     trackMessage,
     handleAntiContact,
     handleAntiLeaveZzs,
