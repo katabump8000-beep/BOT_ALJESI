@@ -1,24 +1,73 @@
-// index.js - الملف الرئيسي المطور والمعالج بالكامل
-// + LogGuard + Watchdog + تنظيف تلقائي + حماية الإشراف + crypto polyfill
-
-"use strict";
+// index.js - BOT ALJESI - ESM Version for Baileys 6.7.9
 
 // ============================================================
-// 🔐 Crypto Polyfill (حل مشكلة crypto is not defined)
+// 🔐 Crypto Polyfill
 // ============================================================
+
+import { webcrypto } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 if (typeof globalThis.crypto === "undefined") {
-    try {
-        const nodeCrypto = require("crypto");
-        if (nodeCrypto.webcrypto) {
-            globalThis.crypto = nodeCrypto.webcrypto;
-        } else {
-            globalThis.crypto = nodeCrypto;
-        }
-    } catch (e) {
-        console.error("⚠️ فشل تحميل crypto polyfill");
-    }
+    globalThis.crypto = webcrypto;
 }
+
+// __dirname for ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ============================================================
+// Imports
+// ============================================================
+
+import baileys from "@whiskeysockets/baileys";
+import P from "pino";
+
+const makeWASocket = baileys.default || baileys;
+const {
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = baileys;
+
+import {
+    getOnNotification,
+    getOffNotification,
+    getViolationMessage,
+    getAdminSaluteMsg
+} from "./dark.js";
+
+import {
+    trackMessage,
+    handleAntiContact,
+    handleAntiLeaveZzs,
+    cleanupRecentMessages
+} from "./haolk.js";
+
+import {
+    addWarning,
+    resetWarnings,
+    checkSpamAndViolations,
+    cleanupMemory,
+    addProtectedAdmin,
+    removeProtectedAdmin,
+    isProtectedAdmin
+} from "./trim.js";
+
+import {
+    DECOR,
+    decorateSuccess,
+    decorateError,
+    decorateLock,
+    decorateRank,
+    decorateInfo,
+    decorateZarfAlert
+} from "./decor.js";
+
+// Load settings.json (ESM way)
+const settingsPath = path.join(__dirname, "settings.json");
+const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
 
 // ============================================================
 // 🛡️ LogGuard
@@ -59,52 +108,6 @@ const logGuard = {
 console.log = (...args) => { if (logGuard.canLog()) _originalLog(...args); };
 console.error = (...args) => { if (logGuard.canLog()) _originalError(...args); };
 console.warn = (...args) => { if (logGuard.canLog()) _originalWarn(...args); };
-
-// ============================================================
-// Imports
-// ============================================================
-
-const baileys = require("@whiskeysockets/baileys");
-const makeWASocket = baileys.default || baileys;
-const {
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion
-} = baileys;
-
-const fs = require("fs");
-const path = require("path");
-
-const settings = require("./settings");
-const {
-    getOnNotification,
-    getOffNotification,
-    getViolationMessage,
-    getAdminSaluteMsg
-} = require("./dark");
-const {
-    trackMessage,
-    handleAntiContact,
-    handleAntiLeaveZzs
-} = require("./haolk");
-const {
-    addWarning,
-    resetWarnings,
-    checkSpamAndViolations,
-    cleanupMemory,
-    addProtectedAdmin,
-    removeProtectedAdmin,
-    isProtectedAdmin
-} = require("./trim");
-const {
-    DECOR,
-    decorateSuccess,
-    decorateError,
-    decorateLock,
-    decorateRank,
-    decorateInfo,
-    decorateZarfAlert
-} = require("./decor");
 
 // ============================================================
 // قاعدة البيانات
@@ -250,20 +253,11 @@ function cleanupKickTracker() {
     } catch {}
 }
 
-function cleanupHaoLkMemory() {
-    try {
-        const haolk = require("./haolk");
-        if (typeof haolk.cleanupRecentMessages === "function") {
-            haolk.cleanupRecentMessages();
-        }
-    } catch {}
-}
-
 function runCleanup() {
     try {
         cleanupMemory();
         cleanupKickTracker();
-        cleanupHaoLkMemory();
+        cleanupRecentMessages();
     } catch (e) {
         _originalError("Cleanup error:", e?.message);
     }
@@ -345,7 +339,7 @@ async function startBot() {
 
         let logger;
         try {
-            logger = require("pino")({ level: "silent" });
+            logger = P({ level: "silent" });
         } catch {}
 
         const sockOptions = {
@@ -353,7 +347,8 @@ async function startBot() {
             printQRInTerminal: false,
             logger,
             markOnlineOnConnect: true,
-            syncFullHistory: false
+            syncFullHistory: false,
+            browser: ["Ubuntu", "Chrome", "20.0.04"]
         };
         if (version) sockOptions.version = version;
 
@@ -438,12 +433,10 @@ async function startBot() {
                 }
                 const settingsJid = db.groupSettings[jid];
 
-                // ميزة المغادرين
                 if (settingsJid.leave && update.action === "remove") {
                     await handleAntiLeaveZzs(sock, update).catch(() => {});
                 }
 
-                // حماية الزرف + حماية الإشراف
                 if (update.action === "remove") {
                     const author = update.author;
                     const target = update.participants?.[0];
@@ -495,7 +488,7 @@ async function startBot() {
                         }
                     }
 
-                    // ⚔️ حماية الزرف العادية
+                    // ⚔️ حماية الزرف
                     if (settingsJid.antiZarf && !isOwnerAuthor) {
                         const now = Date.now();
                         if (!kickTracker[jid]) kickTracker[jid] = {};
@@ -601,9 +594,7 @@ async function handleIncomingMessage(sock, msg) {
         trackMessage(jid, sender, msg.key);
     }
 
-    // ========================================================
     // antiMention
-    // ========================================================
     if (isGroup && settingsJid.antiMention && !isOwner && !msg.key.fromMe) {
         const mentionedJids = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
 
@@ -627,9 +618,7 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // ========================================================
     // حماية جهات الاتصال
-    // ========================================================
     if (settingsJid.protection && (mContent.contactMessage || mContent.vcardMessage)) {
         if (!isOwner && !msg.key.fromMe) {
             await handleAntiContact(sock, jid, sender, msg).catch(() => {});
@@ -637,9 +626,7 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // ========================================================
     // المراقبة
-    // ========================================================
     const isExceptional = db.exceptions?.[jid]?.[sender];
     if (isGroup && settingsJid.monitoring && !isOwner && !isExceptional && !msg.key.fromMe) {
         const violationReason = checkSpamAndViolations(
@@ -677,9 +664,7 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // ========================================================
     // إيموجي عشوائي
-    // ========================================================
     if (settingsJid.emoji && settingsJid.filters.emoji && isGroup && mText && !msg.key.fromMe) {
         if (!global.emojiCounters) global.emojiCounters = {};
         if (!global.emojiCounters[jid]) global.emojiCounters[jid] = 0;
@@ -693,9 +678,7 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // ========================================================
     // الأوامر
-    // ========================================================
     let command = "";
     let args = [];
     const mentioned = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
