@@ -1,10 +1,4 @@
-// decor.js - نظام الزخرفة الموحّد للبوت
-
-"use strict";
-
-// ============================================================
-// 🎨 الزخارف الأساسية
-// ============================================================
+// decor.js - نظام الزخرفة الموحّد للبوت (ESM)
 
 const DECOR = {
     top:    "◆━─━─━─⊱ ⚠️ ⊰─━─━─━◆",
@@ -164,7 +158,7 @@ function decorateZarfAlert(userTag, level = 2) {
     );
 }
 
-module.exports = {
+export {
     DECOR,
     decorateToggle,
     decorateWarning,
