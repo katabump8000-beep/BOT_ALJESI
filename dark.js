@@ -1,8 +1,6 @@
-// dark.js - إدارة الإشعارات والرسائل (مزخرف بالكامل)
+// dark.js - إدارة الإشعارات والرسائل (ESM)
 
-"use strict";
-
-const { decorateToggle, decorateWarning, decorateSuccess } = require("./decor");
+import { decorateToggle, decorateWarning, decorateSuccess } from "./decor.js";
 
 function getOnNotification(type) {
     const titles = {
@@ -81,7 +79,7 @@ function getAdminSaluteMsg(userTag) {
     );
 }
 
-module.exports = {
+export {
     getOnNotification,
     getOffNotification,
     getViolationMessage,
