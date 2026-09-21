@@ -1,16 +1,19 @@
 {
-  "name": "bot-pathira",
+  "name": "whatsapp-bot",
   "version": "1.0.0",
-  "description": "Bot Pathira - WhatsApp Protection Bot",
+  "description": "WhatsApp Bot for Group Protection and Management",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.0",
     "pino": "^8.19.0"
-  }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["whatsapp", "bot", "baileys", "group-management", "protection"],
+  "author": "Bot Owner",
+  "license": "MIT"
 }
