@@ -27,6 +27,13 @@ const BAD_WORDS = [
 const FORBIDDEN_EMOJIS = ["💩", "🖕", "👙", "💋", "👄", "🫦"];
 
 // ============================================================
+// ⚙️ إعدادات مراقبة الملصقات
+// ============================================================
+
+const STICKER_TIME_WINDOW_MS = 8 * 1000; // ⏱️ نافذة زمنية: 8 ثواني
+const STICKER_MAX_COUNT = 4;             // 📊 الحد الأقصى: 4 ملصقات
+
+// ============================================================
 // أدوات
 // ============================================================
 
@@ -120,19 +127,35 @@ function checkSpamAndViolations(sock, jid, sender, msg, mText, mContent, filters
         }
     }
 
-    // 6. الملصقات المتتالية
+    // ============================================================
+    // 6. الملصقات المتتالية (🚨 معدّل)
+    // ============================================================
+    // 📌 القاعدة الجديدة: 4 ملصقات خلال 8 ثواني = مخالفة
     if (filters.sticker && mContent && mContent.stickerMessage) {
         if (!global.userStickers) global.userStickers = {};
-        if (!global.userStickers[sender]) global.userStickers[sender] = { count: 0, updatedAt: Date.now() };
+        if (!global.userStickers[sender]) {
+            global.userStickers[sender] = {
+                timestamps: [],
+                updatedAt: Date.now()
+            };
+        }
 
         const entry = global.userStickers[sender];
-        if (Date.now() - entry.updatedAt > 60 * 1000) entry.count = 0;
-        entry.count++;
-        entry.updatedAt = Date.now();
+        const now = Date.now();
 
-        if (entry.count >= 3) {
-            entry.count = 0;
-            return "ارفاق 3 ملصقات متتالية";
+        // إزالة الطوابع الزمنية القديمة (التي مضى عليها أكثر من 8 ثواني)
+        entry.timestamps = (entry.timestamps || []).filter(
+            ts => now - ts < STICKER_TIME_WINDOW_MS
+        );
+
+        // إضافة الملصق الحالي
+        entry.timestamps.push(now);
+        entry.updatedAt = now;
+
+        // إذا وصل إلى 4 ملصقات خلال 8 ثواني → مخالفة
+        if (entry.timestamps.length >= STICKER_MAX_COUNT) {
+            entry.timestamps = []; // إعادة ضبط
+            return `ارسال ${STICKER_MAX_COUNT} ملصقات متتالية خلال 8 ثواني`;
         }
     }
 
