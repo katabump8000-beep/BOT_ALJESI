@@ -63,6 +63,15 @@ import {
     decorateZarfAlert
 } from "./decor.js";
 
+import {
+    initBotat,
+    onParticipantsUpdate as botatOnParticipants,
+    onMessage as botatOnMessage,
+    onReceipt as botatOnReceipt,
+    handleBotatCommand,
+    cleanupBotat
+} from "./botat.js";
+
 // Load settings.json (ESM way)
 const settingsPath = path.join(__dirname, "settings.json");
 const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
@@ -256,6 +265,7 @@ function runCleanup() {
         cleanupMemory();
         cleanupKickTracker();
         cleanupRecentMessages();
+        cleanupBotat();
     } catch (e) {
         _originalError("Cleanup error:", e?.message);
     }
@@ -384,6 +394,7 @@ async function startBot() {
                 reconnectAttempts = 0;
                 lastActivityAt = Date.now();
                 startWatchdog();
+                initBotat({ owners: getOwnerNumbers(), botNumber: getBotNumber(sock) });
                 _originalLog("✅ تم اتصال البوت بنجاح!");
                 return;
             }
@@ -430,6 +441,11 @@ async function startBot() {
                     db.groupSettings[jid] = DEFAULT_SETTINGS_JID();
                 }
                 const settingsJid = db.groupSettings[jid];
+
+                // 🕵️ كاشف البوتات (فحص الأعضاء الجدد في الاستقبال + سجل الدخول)
+                if (update.action === "add") {
+                    botatOnParticipants(sock, update).catch(() => {});
+                }
 
                 if (settingsJid.leave && update.action === "remove") {
                     await handleAntiLeaveZzs(sock, update).catch(() => {});
@@ -526,6 +542,13 @@ async function startBot() {
         });
 
         // ========================================================
+        // 🕵️ إيصالات القراءة (فخ كاشف البوتات)
+        // ========================================================
+        sock.ev.on("message-receipt.update", (updates) => {
+            botatOnReceipt(sock, updates).catch(() => {});
+        });
+
+        // ========================================================
         // Messages
         // ========================================================
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
@@ -590,6 +613,11 @@ async function handleIncomingMessage(sock, msg) {
 
     if (isGroup && !msg.key.fromMe && !isOwner && !hasLocalAccess) {
         trackMessage(jid, sender, msg.key);
+    }
+
+    // 🕵️ كاشف البوتات (تحليل رسائل الاستقبال)
+    if (isGroup && !msg.key.fromMe) {
+        botatOnMessage(sock, msg).catch(() => {});
     }
 
     // antiMention
@@ -713,6 +741,9 @@ async function handleCommands(ctx) {
         deleteCommandMessage, sender, senderNum, isGroup
     } = ctx;
 
+    // 🕵️ أوامر كاشف البوتات
+    if (await handleBotatCommand({ ...ctx })) return;
+
     // 1. قائمة الأوامر
     if (command === "اوامر" || command === "أوامر") {
         await deleteCommandMessage();
@@ -737,6 +768,10 @@ async function handleCommands(ctx) {
             `├ .مراقبة_روابط on/off\n├ .مراقبة_كلمات on/off\n` +
             `├ .مراقبة_سبام on/off\n├ .مراقبة_صور on/off\n` +
             `├ .مراقبة_لغات on/off\n├ .مراقبة_ايموجي on/off\n\n` +
+            `🕵️ *كاشف البوتات:*\n` +
+            `├ .كاشف on/off\n├ .تعيين_استقبال\n├ .تعيين_اساسي\n` +
+            `├ .فحص @عضو\n├ .قبول @عضو\n├ .قبول_تلقائي on/off\n` +
+            `├ .المشتبهين\n├ .سجل_الدخول\n├ .حالة_الكاشف\n├ .تشخيص_كاشف on/off\n\n` +
             `📄 *عام:*\n├ .الدعم on/off\n├ .ابلاغ [نص]\n` +
             `├ .تصفير @عضو\n├ .إعادة_ضبط_المخالفات\n\n` +
             `${DECOR.topLine}`;
