@@ -4,7 +4,7 @@
 // 🔐 Crypto Polyfill
 // ============================================================
 
-import { webcrypto } from "node:crypto";
+import { webcrypto, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,11 @@ import {
     trackMessage,
     handleAntiContact,
     handleAntiLeaveZzs,
-    cleanupRecentMessages
+    cleanupRecentMessages,
+    cleanupPunished,
+    isPunished,
+    handlePunishedFollowUp,
+    normJid
 } from "./haolk.js";
 
 import {
@@ -138,6 +142,7 @@ let db = {
     globalAuthorized: {},
     groupSettings: {},
     reportGroup: null,
+    blacklistGroups: [],
     exceptions: {}
 };
 
@@ -266,6 +271,7 @@ function runCleanup() {
         cleanupKickTracker();
         cleanupRecentMessages();
         cleanupBotat();
+        cleanupPunished();
     } catch (e) {
         _originalError("Cleanup error:", e?.message);
     }
@@ -308,6 +314,141 @@ function startWatchdog() {
 function stopWatchdog() {
     if (watchdogInterval) clearInterval(watchdogInterval);
     watchdogInterval = null;
+}
+
+// ============================================================
+// ⚡ أدوات السرعة: فك الأغلفة + كاش القروبات + كشف جهات الاتصال
+// ============================================================
+
+const DEBUG_INCOMING = !!process.env.BOT_DEBUG;
+
+// فك أغلفة الرسائل (اختفاء الرسائل، عرض لمرة واحدة، إلخ) حتى لا تضيع النصوص والأوامر
+const WRAPPERS = [
+    "ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2",
+    "viewOnceMessageV2Extension", "documentWithCaptionMessage", "deviceSentMessage"
+];
+
+function unwrapMessage(message) {
+    let m = message;
+    for (let i = 0; i < 6 && m; i++) {
+        const w = WRAPPERS.find(k => m[k]?.message);
+        if (!w) break;
+        m = m[w].message;
+    }
+    return m;
+}
+
+function isContactMessage(m) {
+    if (!m) return false;
+    if (m.contactMessage || m.contactsArrayMessage || m.vcardMessage) return true;
+    const mime = String(m.documentMessage?.mimetype || "").toLowerCase();
+    return mime.includes("vcard");
+}
+
+function messageAgeSec(msg) {
+    const t = Number(msg?.messageTimestamp?.low ?? msg?.messageTimestamp ?? 0);
+    return t ? Math.max(0, Date.now() / 1000 - t) : 0;
+}
+
+// معرّفات الرسائل التي أرسلها البوت نفسه (لتجنب معالجتها كأوامر عند قبول رسائل رقمه)
+const botSentIds = new Set();
+function rememberBotSent(id) {
+    botSentIds.add(id);
+    if (botSentIds.size > 3000) botSentIds.delete(botSentIds.values().next().value);
+}
+function genMessageId() {
+    return "3EB0" + randomBytes(18).toString("hex").toUpperCase();
+}
+
+// كاش بيانات القروبات: يحذف عن Baileys جلب groupMetadata عند كل إرسال (أكبر سبب للبطء)
+const groupMetaCache = new Map();
+const GROUP_META_TTL_MS = 10 * 60 * 1000;
+
+function getCachedMeta(jid) {
+    const e = groupMetaCache.get(jid);
+    return e && Date.now() - e.at < GROUP_META_TTL_MS ? e.meta : undefined;
+}
+
+async function getGroupMetaFast(sock, jid) {
+    const cached = getCachedMeta(jid);
+    if (cached) return cached;
+    try {
+        const meta = await sock.groupMetadata(jid);
+        groupMetaCache.set(jid, { meta, at: Date.now() });
+        return meta;
+    } catch {
+        return null;
+    }
+}
+
+async function warmGroupCache(sock) {
+    try {
+        const all = await sock.groupFetchAllParticipating();
+        for (const [jid, meta] of Object.entries(all || {})) {
+            groupMetaCache.set(jid, { meta, at: Date.now() });
+        }
+        _originalLog(`⚡ تم تحميل ${groupMetaCache.size} قروب في الكاش`);
+    } catch (e) {
+        _originalWarn("⚠️ تعذر تحميل كاش القروبات:", e?.message);
+    }
+}
+
+function applyParticipantsToCache(update) {
+    const e = groupMetaCache.get(update?.id);
+    if (!e?.meta?.participants) return;
+    const ids = (update.participants || []).map(p => (typeof p === "string" ? p : p?.id)).filter(Boolean);
+    const list = e.meta.participants;
+    if (update.action === "add") {
+        for (const id of ids) if (!list.some(p => p.id === id)) list.push({ id, admin: null });
+    } else if (update.action === "remove") {
+        e.meta.participants = list.filter(p => !ids.includes(p.id));
+    } else if (update.action === "promote" || update.action === "demote") {
+        for (const p of list) if (ids.includes(p.id)) p.admin = update.action === "promote" ? "admin" : null;
+    }
+}
+
+function isTrustedSender(jid, sender) {
+    const num = cleanNumber(normJid(sender).split("@")[0]);
+    if (getOwnerNumbers().includes(num)) return true;
+    const norm = normJid(sender);
+    const inMap = (obj) => obj && Object.keys(obj).some(k => normJid(k) === norm);
+    return inMap(db.globalAuthorized) || inMap(db.authorizedUsers?.[jid]);
+}
+
+const contactHooks = {
+    getReportGroups: () => (Array.isArray(db.blacklistGroups) ? db.blacklistGroups : []),
+    getGroupName: async (jid) => (await getGroupMetaFast(currentSock, jid))?.subject
+};
+
+// المسار السريع: متزامن بالكامل حتى لحظة إطلاق الطرد/الحذف. يرجع true إذا استهلك الرسالة.
+function fastContactGuard(sock, msg) {
+    const jid = msg?.key?.remoteJid;
+    if (!jid || !jid.endsWith("@g.us") || msg.key.fromMe) return false;
+    const sender = msg.key.participant;
+    if (!sender) return false;
+    if (!db.groupSettings[jid]?.protection) return false;
+
+    // فيضان من شخص تم طرده للتو: حذف فوري لأي رسالة منه
+    if (isPunished(jid, sender)) {
+        handlePunishedFollowUp(sock, jid, sender, msg);
+        return true;
+    }
+
+    if (!isContactMessage(msg.message)) return false;
+    if (isTrustedSender(jid, sender)) return false;
+
+    handleAntiContact(sock, jid, sender, msg, contactHooks);
+    return true;
+}
+
+// هل تُعالَج هذه الرسالة كرسالة عادية؟ (يشمل رسائل رقم البوت نفسه)
+function shouldProcess(msg, type) {
+    if (!msg?.message) return false;
+    if (msg.key?.id && botSentIds.has(msg.key.id)) return false;
+    if (type === "notify") return true;
+    // رسائل رقم البوت المرسلة من التلفون قد تصل كـ append
+    if (type === "append" && msg.key?.fromMe && messageAgeSec(msg) <= 30) return true;
+    return false;
 }
 
 // ============================================================
@@ -356,12 +497,21 @@ async function startBot() {
             logger,
             markOnlineOnConnect: true,
             syncFullHistory: false,
-            browser: ["Ubuntu", "Chrome", "20.0.04"]
+            browser: ["Ubuntu", "Chrome", "20.0.04"],
+            cachedGroupMetadata: async (gid) => getCachedMeta(gid)
         };
         if (version) sockOptions.version = version;
 
         const sock = makeWASocket(sockOptions);
         currentSock = sock;
+
+        // نسجل معرّف كل رسالة يرسلها البوت قبل إرسالها (حتى لا يعالج البوت رسائله كأوامر)
+        const rawSend = sock.sendMessage.bind(sock);
+        sock.sendMessage = (to, content, options = {}) => {
+            const id = options?.messageId || genMessageId();
+            rememberBotSent(id);
+            return rawSend(to, content, { ...options, messageId: id });
+        };
 
         const owners = getOwnerNumbers();
         const pairingNumber = owners[0] || cleanNumber(settings.botNumber || "");
@@ -395,6 +545,7 @@ async function startBot() {
                 lastActivityAt = Date.now();
                 startWatchdog();
                 initBotat({ owners: getOwnerNumbers(), botNumber: getBotNumber(sock) });
+                warmGroupCache(sock);
                 _originalLog("✅ تم اتصال البوت بنجاح!");
                 return;
             }
@@ -436,6 +587,8 @@ async function startBot() {
 
                 const jid = update.id;
                 if (!jid) return;
+
+                applyParticipantsToCache(update);
 
                 if (!db.groupSettings[jid]) {
                     db.groupSettings[jid] = DEFAULT_SETTINGS_JID();
@@ -551,20 +704,44 @@ async function startBot() {
         // ========================================================
         // Messages
         // ========================================================
+        sock.ev.on("groups.update", (updates) => {
+            for (const u of updates || []) {
+                const e = groupMetaCache.get(u?.id);
+                if (e?.meta) Object.assign(e.meta, u);
+            }
+        });
+
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
-            if (type !== "notify") return;
             if (!Array.isArray(messages) || !messages.length) return;
 
-            const msg = messages[0];
-            if (!msg?.message) return;
-
-            lastActivityAt = Date.now();
-
-            try {
-                await handleIncomingMessage(sock, msg);
-            } catch (e) {
-                _originalError("Message handling error:", e?.message);
+            // 1) المرحلة السريعة (متزامنة): فك الأغلفة + ضرب جهات الاتصال فوراً لكل الرسائل في الدفعة
+            const rest = [];
+            for (const m of messages) {
+                try {
+                    if (m?.message) m.message = unwrapMessage(m.message);
+                    if (DEBUG_INCOMING) {
+                        _originalLog(`[in] type=${type} fromMe=${m?.key?.fromMe} jid=${m?.key?.remoteJid} id=${m?.key?.id} keys=${Object.keys(m?.message || {}).join(",")}`);
+                    }
+                    if (type === "notify" || (type === "append" && messageAgeSec(m) <= 120)) {
+                        if (fastContactGuard(sock, m)) continue;
+                    }
+                } catch (e) {
+                    _originalError("Fast guard error:", e?.message);
+                }
+                rest.push(m);
             }
+
+            // 2) المعالجة العادية لكل رسالة (بالتوازي، وليس أول رسالة فقط)
+            const work = [];
+            for (const msg of rest) {
+                if (!shouldProcess(msg, type)) continue;
+                lastActivityAt = Date.now();
+                work.push(
+                    handleIncomingMessage(sock, msg).catch(e =>
+                        _originalError("Message handling error:", e?.message))
+                );
+            }
+            if (work.length) await Promise.allSettled(work);
         });
 
         _originalLog("✅ تم تسجيل جميع Events");
@@ -644,13 +821,7 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // حماية جهات الاتصال
-    if (settingsJid.protection && (mContent.contactMessage || mContent.vcardMessage)) {
-        if (!isOwner && !msg.key.fromMe) {
-            await handleAntiContact(sock, jid, sender, msg).catch(() => {});
-            return;
-        }
-    }
+    // حماية جهات الاتصال: تُعالج الآن في المسار السريع (fastContactGuard) قبل الوصول هنا
 
     // المراقبة
     const isExceptional = db.exceptions?.[jid]?.[sender];
@@ -744,6 +915,104 @@ async function handleCommands(ctx) {
     // 🕵️ أوامر كاشف البوتات
     if (await handleBotatCommand({ ...ctx })) return;
 
+    // 📋 .قائمة on/off : تعيين هذا الجروب لاستقبال استمارات المؤبدين
+    if ((command === "قائمة" || command === "القائمة") && getMessageText(msg).trim().startsWith(".")) {
+        await deleteCommandMessage();
+        if (!isOwner && !hasLocalAccess) return;
+        if (!isGroup) return;
+
+        const action = args[0]?.toLowerCase();
+        if (!Array.isArray(db.blacklistGroups)) db.blacklistGroups = [];
+
+        if (action === "on") {
+            if (!db.blacklistGroups.includes(jid)) db.blacklistGroups.push(jid);
+            saveDb();
+            await sock.sendMessage(jid, {
+                text:
+                    `◆━─━─━─⊱⊰─━─━─━◆\n` +
+                    `تم تعيين هذا الجروب لأخبار \n` +
+                    `المؤبدين الذين فشلو في تبنيد\n` +
+                    `القروبات. بنجاح 🟢\n` +
+                    `◆━─━─━─⊱⊰─━─━─━◆`
+            });
+        } else if (action === "off") {
+            db.blacklistGroups = db.blacklistGroups.filter(g => g !== jid);
+            saveDb();
+            await sock.sendMessage(jid, {
+                text: decorateError("القائمة", "🔴 تم إلغاء تعيين هذا الجروب لأخبار المؤبدين.")
+            });
+        } else {
+            await sock.sendMessage(jid, {
+                text: decorateInfo("استخدام الأمر", "⚠️ الاستخدام:\n.قائمة on\n.قائمة off")
+            });
+        }
+        return;
+    }
+
+    // 🚫 .سحب صلاحيات @عضو : سحب كل صلاحياته من البوت في كل القروبات
+    if (
+        (command === "سحب" && (args[0] === "صلاحيات" || args[0] === "الصلاحيات")) ||
+        command === "سحب_صلاحيات"
+    ) {
+        if (!getMessageText(msg).trim().startsWith(".")) return;
+        await deleteCommandMessage();
+        if (!isOwner) {
+            await sock.sendMessage(jid, {
+                text: decorateError("صلاحيات", "⚠️ أمر `.سحب صلاحيات` خاص بالمالك الأساسي فقط.")
+            });
+            return;
+        }
+
+        let target = mentioned[0];
+        if (!target) {
+            const digits = cleanNumber(args.find(a => cleanNumber(a).length >= 7) || "");
+            if (digits) target = `${digits}@s.whatsapp.net`;
+        }
+        if (!target) {
+            await sock.sendMessage(jid, {
+                text: decorateInfo("استخدام الأمر", "⚠️ الاستخدام:\n.سحب صلاحيات @عضو")
+            });
+            return;
+        }
+
+        const targetNum = cleanNumber(target.split("@")[0].split(":")[0]);
+        if (getOwnerNumbers().includes(targetNum)) {
+            await sock.sendMessage(jid, {
+                text: decorateError("سحب صلاحيات", "⛔ لا يمكن سحب صلاحيات المالك.")
+            });
+            return;
+        }
+
+        const sameUser = (k) => cleanNumber(String(k).split("@")[0].split(":")[0]) === targetNum;
+        let removed = 0;
+
+        for (const k of Object.keys(db.globalAuthorized || {})) {
+            if (sameUser(k)) { delete db.globalAuthorized[k]; removed++; }
+        }
+        for (const g of Object.keys(db.authorizedUsers || {})) {
+            for (const k of Object.keys(db.authorizedUsers[g] || {})) {
+                if (sameUser(k)) { delete db.authorizedUsers[g][k]; removed++; }
+            }
+        }
+        // سحب الإشراف المحمي (.اشرافه) من كل القروبات
+        for (const g of Object.keys(db.groupSettings || {})) {
+            try { if (removeProtectedAdmin(g, target)) removed++; } catch {}
+        }
+        saveDb();
+
+        await sock.sendMessage(jid, {
+            text: decorateSuccess(
+                "سحب صلاحيات",
+                `عزيزي/تي @${targetNum}\n` +
+                `⚙️ تم سحب كل صلاحياتك من البوت في جميع القروبات ❌\n` +
+                `📊 عدد الصلاحيات المسحوبة: ${removed}`
+            ),
+            mentions: [target]
+        });
+        return;
+    }
+
+
     // 1. قائمة الأوامر
     if (command === "اوامر" || command === "أوامر") {
         await deleteCommandMessage();
@@ -761,6 +1030,7 @@ async function handleCommands(ctx) {
             `📌 *أوامر الإدارة:*\n` +
             `├ .قفل\n├ .فتح\n├ .ترقية @عضو\n├ .إعفاء @عضو\n` +
             `├ .اشرافه @عضو 🛡️\n├ .الغاء_اشرافه @عضو\n` +
+            `├ .سحب صلاحيات @عضو\n├ .قائمة on/off\n` +
             `├ .معلومات\n├ .استثناء @عضو\n\n` +
             `🛡️ *الحماية والمراقبة:*\n` +
             `├ .حماية on/off\n├ .مراقبة on/off\n├ .مغادرة on/off\n` +

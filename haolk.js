@@ -25,51 +25,201 @@ function cleanupRecentMessages() {
     } catch {}
 }
 
-async function handleAntiContact(sock, jid, sender, msg) {
-    try {
-        if (!msg?.key) return;
+// ============================================================
+// ⚡ حماية جهات الاتصال - نسخة فائقة السرعة
+// ============================================================
+// المبدأ:
+//   1) أول جهة اتصال => طرد + حذف في نفس اللحظة (بالتوازي، بدون await متسلسل)
+//   2) أي رسالة تصل بعدها من نفس الشخص (الفيضان اللي بالطريق) => حذف فوري
+//   3) بعد ما تنتهي الضربة => التحذيرات + القفل + استمارة القائمة (خارج المسار الحرج)
 
-        await sock.sendMessage(jid, { delete: msg.key }).catch(() => {});
-        await sock.groupSettingUpdate(jid, "announcement").catch(() => {});
+const PUNISH_WINDOW_MS = 60 * 1000;      // مدة اعتبار المرسل "معاقَب" وحذف كل ما يصل منه
+const LOCK_REOPEN_MS = 10 * 60 * 1000;   // فتح القروب بعد القفل الاحترازي
 
-        const userTag = `@${sender.split("@")[0]}`;
-        await sock.sendMessage(jid, {
-            text:
-                `${DECOR.top}\n` +
-                `   ${DECOR.warn} *محاولة تبنيد فاشلة* ${DECOR.warn}\n` +
-                `${DECOR.bottom}\n` +
-                `${DECOR.sepStar}\n` +
-                `⛔ عزيزي ${userTag}\n` +
-                `🚫 محاولتك بتنيد القروب عبر إرسال جهة اتصال باءت بالفشل\n` +
-                `${DECOR.sepStar}\n` +
-                `${DECOR.topEm}`,
-            mentions: [sender]
-        }).catch(() => {});
+// ✏️ نصوص الاستمارة (عدّلها من هنا)
+const FORM_STATUS = "مؤبد تبنيد";
+const FORM_NICK = "عرصا وعاهرة وفاشل";
+const FORM_OWNER = "آلَجَيـــــــًّسًـــــي";
+const FORM_TRIGGER = ".مؤبد";
+const RLM = "\u200F";
 
-        try { await sock.groupParticipantsUpdate(jid, [sender], "remove"); } catch {}
+const punished = new Map();      // "group|user" -> { until, startedAt, contacts, deleted, failed, lastDoneAt }
+const deletedIds = new Set();    // لمنع حذف نفس الرسالة مرتين
+let punishedCleanupTimer = null;
 
-        await sock.sendMessage(jid, {
-            text:
-                `${DECOR.topEm}\n` +
-                `  ${DECOR.warn} *محاولة تبنيد فاشلة* ${DECOR.warn}\n` +
-                `${DECOR.sepStar}\n` +
-                `🔒 تم إغلاق القروب احترازياً\n` +
-                `⏳ سيتم الفتح بعد 10 دقائق\n` +
-                `🙏 يرجى التحلي بالصبر\n` +
-                `${DECOR.sepStar}\n` +
-                `${DECOR.bottomEm}`
-        }).catch(() => {});
+function normJid(jid) {
+    const s = String(jid || "");
+    const at = s.indexOf("@");
+    if (at < 0) return s;
+    const left = s.slice(0, at).split(":")[0].split("_")[0];
+    return `${left}${s.slice(at)}`;
+}
 
-        setTimeout(async () => {
-            try {
-                await sock.groupSettingUpdate(jid, "not_announcement");
-                await sock.sendMessage(jid, { text: decorateLock(false) }).catch(() => {});
-            } catch {}
-        }, 10 * 60 * 1000);
+function isPunished(jid, sender) {
+    const rec = punished.get(`${jid}|${normJid(sender)}`);
+    return !!rec && rec.until > Date.now();
+}
 
-    } catch (err) {
-        console.error("خطأ في التعامل مع جهة الاتصال:", err?.message);
+function rememberDeleted(id) {
+    deletedIds.add(id);
+    if (deletedIds.size > 2000) deletedIds.delete(deletedIds.values().next().value);
+}
+
+// حذف فوري: لا await قبل الإرسال، مع إعادة محاولة واحدة
+function fireDelete(sock, jid, key, rec) {
+    if (!key?.id || deletedIds.has(key.id)) return;
+    rememberDeleted(key.id);
+
+    const attempt = (retry) =>
+        sock.sendMessage(jid, { delete: key })
+            .then(() => { rec.deleted++; rec.lastDoneAt = Date.now(); })
+            .catch(() => {
+                if (retry) return attempt(false);
+                rec.failed++; rec.lastDoneAt = Date.now();
+            });
+    attempt(true);
+}
+
+// طرد مع إعادة محاولة سريعة عند الفشل
+function fireKick(sock, jid, who, attemptsLeft = 3) {
+    sock.groupParticipantsUpdate(jid, [who], "remove")
+        .then((res) => {
+            const st = String(res?.[0]?.status || "200");
+            if (st !== "200" && attemptsLeft > 1) {
+                setTimeout(() => fireKick(sock, jid, who, attemptsLeft - 1), 250);
+            }
+        })
+        .catch(() => {
+            if (attemptsLeft > 1) setTimeout(() => fireKick(sock, jid, who, attemptsLeft - 1), 250);
+        });
+}
+
+// رسالة تصل من شخص معاقَب: حذف فوري بغض النظر عن نوعها
+function handlePunishedFollowUp(sock, jid, sender, msg) {
+    const rec = punished.get(`${jid}|${normJid(sender)}`);
+    if (!rec) return;
+    rec.until = Date.now() + PUNISH_WINDOW_MS;
+    rec.contacts++;
+    fireDelete(sock, jid, msg.key, rec);
+}
+
+function buildForm(groupName, tag) {
+    return [
+        `${RLM}\`إستمارة الوورك\``,
+        ``,
+        `${RLM}_*الـحـالـة*_: ┊ ${FORM_STATUS} ┊`,
+        `${RLM}_*الـلــقـب*_: ┊ ${FORM_NICK} ┊`,
+        `${RLM}_*الطــرف*_: ┊ ${groupName} ┊`,
+        `${RLM}_*المسؤول*_: ┊ ${FORM_OWNER} ┊`,
+        `${RLM}${RLM}_*المنشن*_: ┊ ${tag} ┊`,
+        ``,
+        `${RLM}╮──────────────╭`,
+        `${RLM}                    ▅تــوقــيــع▅`,
+        `${RLM}🍷 *𝑭. 𝑰. 𝑹* 🍂`,
+        `${RLM}╯──────────────╰`
+    ].join("\n");
+}
+
+// إرسال الاستمارة ثم الرد عليها بـ .مؤبد
+async function sendBlacklistForms(sock, targets, groupName, who) {
+    const tag = `@${who.split("@")[0]}`;
+    const text = buildForm(groupName, tag);
+    for (const target of targets) {
+        try {
+            const formMsg = await sock.sendMessage(target, { text, mentions: [who] });
+            await sock.sendMessage(target, { text: FORM_TRIGGER }, { quoted: formMsg });
+        } catch (e) {
+            console.error("فشل إرسال الاستمارة:", e?.message);
+        }
     }
+}
+
+// المدخل الرئيسي: يُستدعى مباشرة من index.js (متزامن، لا ينتظر شيئاً)
+// hooks = { getGroupName(jid), getReportGroups() }
+function handleAntiContact(sock, jid, sender, msg, hooks = {}) {
+    const who = normJid(sender);
+    const key = `${jid}|${who}`;
+    const now = Date.now();
+
+    let rec = punished.get(key);
+    const first = !rec || rec.until < now;
+    if (first) {
+        rec = { until: now + PUNISH_WINDOW_MS, startedAt: now, contacts: 0, deleted: 0, failed: 0, lastDoneAt: now };
+        punished.set(key, rec);
+    }
+    rec.until = now + PUNISH_WINDOW_MS;
+    rec.contacts++;
+
+    if (first) fireKick(sock, jid, who);   // الطرد أولاً: يقطع الفيضان
+    fireDelete(sock, jid, msg.key, rec);   // والحذف في نفس اللحظة
+
+    if (first) {
+        postStrike(sock, jid, who, sender, rec, hooks).catch(() => {});
+    }
+}
+
+// كل ما بعد الضربة الأولى (خارج المسار الحرج)
+async function postStrike(sock, jid, who, senderRaw, rec, hooks) {
+    // نمهل الفيضان يصل ويُحذف قبل ما نبدأ بالرسائل
+    await new Promise(r => setTimeout(r, 1500));
+
+    // تقرير السرعة (يفيدك تشوف الأداء الفعلي)
+    const took = rec.lastDoneAt - rec.startedAt;
+    console.log(`⚡ ضربة جهات اتصال: ${rec.contacts} رسالة | محذوف ${rec.deleted} | فشل ${rec.failed} | آخر حذف بعد ${took}ms`);
+
+    const userTag = `@${who.split("@")[0]}`;
+
+    // القفل الاحترازي (بالتوازي مع التحذير)
+    sock.groupSettingUpdate(jid, "announcement").catch(() => {});
+
+    sock.sendMessage(jid, {
+        text:
+            `${DECOR.top}\n` +
+            `   ${DECOR.warn} *محاولة تبنيد فاشلة* ${DECOR.warn}\n` +
+            `${DECOR.bottom}\n` +
+            `${DECOR.sepStar}\n` +
+            `⛔ عزيزي ${userTag}\n` +
+            `🚫 محاولتك بتبنيد القروب عبر إرسال جهة اتصال باءت بالفشل\n` +
+            `🗑️ تم حذف ${rec.contacts} رسالة وطرد المرسل\n` +
+            `${DECOR.sepStar}\n` +
+            `${DECOR.topEm}`,
+        mentions: [who]
+    }).catch(() => {});
+
+    sock.sendMessage(jid, {
+        text:
+            `${DECOR.topEm}\n` +
+            `  ${DECOR.warn} *محاولة تبنيد فاشلة* ${DECOR.warn}\n` +
+            `${DECOR.sepStar}\n` +
+            `🔒 تم إغلاق القروب احترازياً\n` +
+            `⏳ سيتم الفتح بعد 10 دقائق\n` +
+            `🙏 يرجى التحلي بالصبر\n` +
+            `${DECOR.sepStar}\n` +
+            `${DECOR.bottomEm}`
+    }).catch(() => {});
+
+    setTimeout(async () => {
+        try {
+            await sock.groupSettingUpdate(jid, "not_announcement");
+            await sock.sendMessage(jid, { text: decorateLock(false) }).catch(() => {});
+        } catch {}
+    }, LOCK_REOPEN_MS);
+
+    // 📋 استمارة القائمة (.قائمة on) + الرد عليها بـ .مؤبد
+    try {
+        const targets = (hooks.getReportGroups?.() || []).filter(Boolean);
+        if (targets.length) {
+            const groupName = (await hooks.getGroupName?.(jid)) || "غير معروف";
+            await sendBlacklistForms(sock, targets, groupName, who);
+        }
+    } catch (e) {
+        console.error("خطأ الاستمارة:", e?.message);
+    }
+}
+
+function cleanupPunished() {
+    const now = Date.now();
+    for (const [k, v] of punished) if (v.until < now) punished.delete(k);
 }
 
 async function handleAntiLeaveZzs(sock, update) {
@@ -123,5 +273,9 @@ export {
     trackMessage,
     handleAntiContact,
     handleAntiLeaveZzs,
-    cleanupRecentMessages
+    cleanupRecentMessages,
+    cleanupPunished,
+    isPunished,
+    handlePunishedFollowUp,
+    normJid
 };
