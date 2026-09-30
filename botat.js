@@ -35,11 +35,12 @@ const DEFAULT_CONFIG = {
     quickReplyMs: 2500,               // تفاعل خلال هذه المدة بعد الترحيب يعتبر آلياً
     taskText: "اكتب كلمة *تم* هنا للتوثيق ✅",
     points: {
-        linked1: 1,        // جهاز مرتبط واحد
-        linked2: 2,        // جهازان مرتبطان أو أكثر
-        msgDevice: 3,      // أرسل رسالة المهمة من جهاز غير 0
+        linked1: 3,        // جهاز مرتبط واحد => مراجعة مباشرة (بوت أو ويب)
+        linked2: 4,        // جهازان مرتبطان أو أكثر
+        msgDevice: 2,      // أرسل رسالة من جهاز غير 0
         idBaeSig: 3,       // معرّف يبدأ BAE5 (توقيع Baileys قديم)
-        idLongWebSig: 2,   // 3EB0 بطول 36+ (نمط Baileys الحديث المحتمل)
+        idWebSig: 1,       // معرّف يبدأ 3EB0 (نمط عميل ويب/مكتبة، وليس تطبيق الجوال)
+        companionOnly: 3,  // لا يرسل إلا من جهاز مرتبط/عميل ويب (سلوك بوت)
         quickRead1: 1,
         quickReadRepeat: 2,
         autoReaction: 3
@@ -153,6 +154,43 @@ function getRecord(jid, create = true) {
     return db.members[key] || null;
 }
 
+// ============================================================
+// 📈 إحصاءات السلوك عبر كل القروبات (أقوى دليل على بوت نشط)
+// الإنسان يرسل غالباً من جواله (device 0)، أما البوت فلا يرسل إلا من جهاز مرتبط
+// ============================================================
+
+if (!db.stats) db.stats = {};
+let saveTimer = null;
+function saveDbSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => { saveTimer = null; saveDb(); }, 5000);
+    saveTimer.unref?.();
+}
+
+const COMPANION_MIN_MSGS = 6;
+
+function observeSender(num, ka) {
+    const now = Date.now();
+    const st = db.stats[num] || (db.stats[num] = { d0: 0, dx: 0, w: 0, o: 0, ids: [], first: now, last: now });
+    if (ka.device > 0) st.dx++; else st.d0++;
+    if (/^3EB0/i.test(ka.id)) st.w++; else st.o++;
+    st.ids.push(ka.id);
+    if (st.ids.length > 5) st.ids.shift();
+    st.last = now;
+
+    const keys = Object.keys(db.stats);
+    if (keys.length > 4000) {
+        keys.sort((a, b) => db.stats[a].last - db.stats[b].last);
+        for (const k of keys.slice(0, 500)) delete db.stats[k];
+    }
+    return st;
+}
+
+function isCompanionOnly(st) {
+    return (st.dx >= COMPANION_MIN_MSGS && st.d0 === 0) ||
+           (st.w >= COMPANION_MIN_MSGS && st.o === 0);
+}
+
 function setSignal(rec, key, points, reason) {
     if (!points) return;
     rec.signals[key] = { points, reason, at: Date.now() };
@@ -234,7 +272,7 @@ async function scanDevices(sock, rec) {
     if (res.ok && res.count >= 2) {
         setSignal(rec, "linkedDevices", P.linked2, `${res.count} أجهزة مرتبطة بالرقم`);
     } else if (res.ok && res.count === 1) {
-        setSignal(rec, "linkedDevices", P.linked1, "جهاز مرتبط واحد (قد يكون واتساب ويب)");
+        setSignal(rec, "linkedDevices", P.linked1, "جهاز مرتبط واحد (بوت أو واتساب ويب)");
     } else if (rec.signals.linkedDevices) {
         delete rec.signals.linkedDevices;
         rec.score = Object.values(rec.signals).reduce((a, s) => a + s.points, 0);
@@ -257,8 +295,8 @@ export function analyzeKey(key) {
     }
     if (/^BAE5/i.test(id)) {
         found.push({ key: "idFingerprint", points: P.idBaeSig, reason: `معرّف الرسالة بتوقيع BAE5 (${id.length} حرف)` });
-    } else if (/^3EB0/i.test(id) && id.length >= 36) {
-        found.push({ key: "idFingerprint", points: P.idLongWebSig, reason: `معرّف بنمط 3EB0 طويل (${id.length} حرف)` });
+    } else if (/^3EB0/i.test(id)) {
+        found.push({ key: "idFingerprint", points: P.idWebSig, reason: `معرّف بنمط عميل ويب/مكتبة 3EB0 (${id.length} حرف)` });
     }
     return { id, device, found };
 }
@@ -340,6 +378,16 @@ function reportText(rec, title = "تقرير فحص عضو") {
             : `📱 الأجهزة: تعذر الفحص - ${rec.devices.error}`);
     }
     lines.push(`✅ نفّذ المهمة: ${rec.taskDone ? "نعم" : "لا"}`);
+    const st = db.stats?.[numOf(rec.jid)];
+    if (st) {
+        lines.push(`📈 رسائله: من الجوال ${st.d0} | من جهاز مرتبط ${st.dx} | معرّف ويب ${st.w}/${st.w + st.o}`);
+    }
+    const sg = rec.signals;
+    if (sg.companionOnly || sg.quickRead || sg.autoReaction || /BAE5/.test(sg.idFingerprint?.reason || "")) {
+        lines.push("🤖 *التقدير:* مؤشرات سلوك آلي (بوت محتمل)");
+    } else if (sg.linkedDevices) {
+        lines.push("ℹ️ *التقدير:* جهاز مرتبط: بوت أو واتساب ويب (لا تفريق بينهما بدون سلوك)");
+    }
     const sig = Object.values(rec.signals);
     if (sig.length) {
         lines.push("", "*الإشارات:*", ...sig.map(s => `• ${s.reason} (+${s.points})`));
@@ -479,17 +527,45 @@ function scheduleFinalize(sock, memberJid) {
     finalizeTimers.set(key, t);
 }
 
-// messages.upsert (رسائل القروبات فقط)
+// messages.upsert (رسائل القروبات)
 export async function onMessage(sock, msg) {
     try {
         const c = cfg();
-        if (!c.enabled || !c.receptionGroup) return;
+        if (!c.enabled) return;
         const group = msg?.key?.remoteJid;
-        if (group !== c.receptionGroup || msg.key.fromMe) return;
+        if (!group || !group.endsWith("@g.us") || msg.key.fromMe) return;
 
         const participant = msg.key.participant;
         if (!participant || isExempt(participant)) return;
 
+        // 1) إحصاءات السلوك في كل القروبات
+        const ka = analyzeKey(msg.key);
+        const num = numOf(participant);
+        const st = observeSender(num, ka);
+        saveDbSoon();
+
+        const inReception = !!c.receptionGroup && group === c.receptionGroup;
+
+        // 2) خارج الاستقبال: لا نتحرك إلا لو ثبت سلوك بوت (كل رسائله من جهاز مرتبط)
+        if (!inReception) {
+            if (!isCompanionOnly(st)) return;
+            const rec = getRecord(participant);
+            if (msg.pushName) rec.name = msg.pushName;
+            if (rec.signals.companionOnly) return;
+            setSignal(rec, "companionOnly", c.points.companionOnly,
+                `${st.dx + st.w > 0 ? "كل رسائله" : ""} من جهاز مرتبط/عميل ويب (${Math.max(st.dx, st.w)} رسالة بدون أي رسالة من الجوال)`);
+            if (!rec.devices) await scanDevices(sock, rec);
+            rec.level = classify(rec.score);
+            if (!rec.alerted) {
+                rec.alerted = true;
+                rec.status = "review";
+                await notifyOwners(sock, reportText(rec, "🤖 سلوك بوت محتمل (رُصد خارج الاستقبال)") + `\n📍 القروب: ${group}`);
+            }
+            saveDb();
+            return;
+        }
+
+        // 3) داخل الاستقبال: التحليل الكامل
         const rec = getRecord(participant);
         if (msg.pushName) rec.name = msg.pushName;
 
@@ -499,11 +575,14 @@ export async function onMessage(sock, msg) {
             scheduleFinalize(sock, participant);
         }
 
-        const ka = analyzeKey(msg.key);
         if (c.debug) {
-            console.log(`[botat] رسالة ${numOf(participant)} | id=${ka.id} (${ka.id.length}) | device=${ka.device}`);
+            console.log(`[botat] رسالة ${num} | id=${ka.id} (${ka.id.length}) | device=${ka.device}`);
         }
         for (const f of ka.found) setSignal(rec, f.key, f.points, f.reason);
+        if (isCompanionOnly(st)) {
+            setSignal(rec, "companionOnly", c.points.companionOnly,
+                `كل رسائله من جهاز مرتبط/عميل ويب (${Math.max(st.dx, st.w)} رسالة)`);
+        }
 
         const isReaction = !!msg.message?.reactionMessage;
         const sinceBait = rec.baitSentAt ? Date.now() - rec.baitSentAt : Infinity;
@@ -547,7 +626,7 @@ function pickTarget(ctx) {
 
 const BOTAT_COMMANDS = new Set([
     "كاشف", "تعيين_استقبال", "تعيين_اساسي", "قبول_تلقائي",
-    "فحص", "قبول", "المشتبهين", "سجل_الدخول", "تشخيص_كاشف", "حالة_الكاشف"
+    "فحص", "قبول", "المشتبهين", "سجل_الدخول", "تشخيص_كاشف", "حالة_الكاشف", "بصمة"
 ]);
 
 // يرجع true إذا عالج الأمر
@@ -614,6 +693,33 @@ export async function handleBotatCommand(ctx) {
         rec.level = classify(rec.score);
         saveDb();
         return reply(reportText(rec)), true;
+    }
+
+    if (command === "بصمة") {
+        const target = pickTarget(ctx);
+        if (!target) return reply("الاستخدام: `.بصمة @عضو` أو رد على رسالته أو اكتب رقمه"), true;
+        const num = numOf(target);
+        const st = db.stats?.[num];
+        const rec = getRecord(target, false);
+        const lines = [`🔬 *بصمة ${num}*`];
+        if (st) {
+            lines.push(
+                `رسائل من الجوال (device 0): ${st.d0}`,
+                `رسائل من جهاز مرتبط: ${st.dx}`,
+                `معرّفات 3EB0 (ويب/مكتبة): ${st.w} | غيرها: ${st.o}`,
+                `آخر المعرّفات:\n${st.ids.map(i => `• ${i} (${i.length})`).join("\n") || "-"}`
+            );
+        } else {
+            lines.push("لا توجد رسائل مرصودة منه بعد (يُرصد فقط ما يرسله بعد تشغيل هذا الإصدار).");
+        }
+        if (rec?.devices) {
+            lines.push(rec.devices.ok
+                ? `الأجهزة: [${rec.devices.list.join(", ")}] عبر ${rec.devices.method}`
+                : `فحص الأجهزة فشل: ${rec.devices.error}`);
+        } else {
+            lines.push("لم يُفحص الأجهزة بعد (استخدم `.فحص`).");
+        }
+        return reply(lines.join("\n")), true;
     }
 
     if (command === "قبول") {

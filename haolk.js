@@ -120,17 +120,55 @@ function buildForm(groupName, tag) {
     ].join("\n");
 }
 
-// إرسال الاستمارة ثم الرد عليها بـ .مؤبد
+// إرسال الاستمارة ثم الرد عليها بـ .مؤبد (مع إعادة محاولة وخطة بديلة + أخطاء ظاهرة)
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function sendWithRetry(fn, label, tries = 3) {
+    for (let i = 1; i <= tries; i++) {
+        try {
+            const r = await fn();
+            return r || true;
+        } catch (e) {
+            console.error(`❌ ${label} (محاولة ${i}/${tries}):`, e?.message || e);
+            if (i < tries) await sleep(500 * i);
+        }
+    }
+    return null;
+}
+
 async function sendBlacklistForms(sock, targets, groupName, who) {
     const tag = `@${who.split("@")[0]}`;
     const text = buildForm(groupName, tag);
+
     for (const target of targets) {
-        try {
-            const formMsg = await sock.sendMessage(target, { text, mentions: [who] });
-            await sock.sendMessage(target, { text: FORM_TRIGGER }, { quoted: formMsg });
-        } catch (e) {
-            console.error("فشل إرسال الاستمارة:", e?.message);
+        const formMsg = await sendWithRetry(
+            () => sock.sendMessage(target, { text, mentions: [who] }),
+            "إرسال الاستمارة"
+        );
+        if (!formMsg) continue;
+
+        await sleep(400);   // فاصل صغير بين الاستمارة والرد
+
+        // الرد المقتبس على الاستمارة (كائن الرسالة كاملاً، أو نبنيه يدوياً لو ما رجع)
+        const quotable = (formMsg && formMsg !== true && formMsg.key && formMsg.message)
+            ? formMsg
+            : (formMsg?.key ? { key: formMsg.key, message: { extendedTextMessage: { text } } } : null);
+
+        let ok = null;
+        if (quotable) {
+            ok = await sendWithRetry(
+                () => sock.sendMessage(target, { text: FORM_TRIGGER }, { quoted: quotable }),
+                "رد .مؤبد (مقتبس)", 2
+            );
         }
+        if (!ok) {
+            // خطة بديلة: إرسال .مؤبد بدون اقتباس بدل ما ينقطع كلياً
+            ok = await sendWithRetry(
+                () => sock.sendMessage(target, { text: FORM_TRIGGER }),
+                "رد .مؤبد (بدون اقتباس)", 2
+            );
+        }
+        if (!ok) console.error("🚫 تعذر إرسال .مؤبد نهائياً إلى", target);
     }
 }
 
