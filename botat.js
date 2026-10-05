@@ -33,6 +33,7 @@ const DEFAULT_CONFIG = {
     finalizeAfterMs: 3 * 60 * 1000,   // مهلة الحكم النهائي بعد الدخول
     quickReadMs: 2500,                // القراءة الأسرع من هذا تعتبر آلية
     quickReplyMs: 2500,               // تفاعل خلال هذه المدة بعد الترحيب يعتبر آلياً
+    detectMinLinked: 1,               // أقل عدد أجهزة مرتبطة يُعتبر كشفاً في القروبات المفعّل فيها .كاشف
     taskText: "اكتب كلمة *تم* هنا للتوثيق ✅",
     points: {
         linked1: 3,        // جهاز مرتبط واحد => مراجعة مباشرة (بوت أو ويب)
@@ -51,7 +52,7 @@ const DEFAULT_CONFIG = {
 // التخزين
 // ============================================================
 
-let db = { config: {}, members: {}, joinLog: [] };
+let db = { config: {}, members: {}, joinLog: [], detectGroups: {} };
 
 try {
     if (fs.existsSync(DB_FILE)) {
@@ -93,9 +94,12 @@ const scanCache = new Map();      // memberKey -> { at, result }
 const SCAN_CACHE_MS = 5 * 60 * 1000;
 const MAX_BAITS = 300;
 
-export function initBotat({ owners = [], botNumber = "" } = {}) {
+let trustedHook = () => false;
+
+export function initBotat({ owners = [], botNumber = "", isTrusted = null } = {}) {
     ownerNumbers = owners.map(n => String(n).replace(/[^0-9]/g, "")).filter(Boolean);
     selfNumber = String(botNumber).replace(/[^0-9]/g, "");
+    if (typeof isTrusted === "function") trustedHook = isTrusted;
 }
 
 // ============================================================
@@ -127,6 +131,15 @@ function isExempt(jid) {
     const n = numOf(jid);
     return !n || n === selfNumber || ownerNumbers.includes(n);
 }
+
+// مستثنى داخل قروب معيّن (المالك + البوت + أصحاب الصلاحيات في البوت)
+function isExemptIn(group, jid) {
+    if (isExempt(jid)) return true;
+    try { return !!trustedHook(group, jid); } catch { return false; }
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const toId = (p) => (typeof p === "string" ? p : p?.id || "");
 
 // ============================================================
 // سجل العضو + النقاط
@@ -160,6 +173,7 @@ function getRecord(jid, create = true) {
 // ============================================================
 
 if (!db.stats) db.stats = {};
+if (!db.detectGroups || typeof db.detectGroups !== "object") db.detectGroups = {};
 let saveTimer = null;
 function saveDbSoon() {
     if (saveTimer) return;
@@ -441,6 +455,99 @@ async function evaluate(sock, rec, { final = false } = {}) {
 }
 
 // ============================================================
+// 🚨 الكشف داخل القروبات المفعّل فيها .كاشف on
+// أي عضو جديد يُفحص فوراً (حتى لو لم يرسل أي رسالة) عبر الأجهزة المرتبطة بالرقم
+// ============================================================
+
+const ALERT_COOLDOWN_MS = 10 * 60 * 1000;
+const groupQueues = new Map();   // group -> promise chain (لتسلسل الفحوص ومنع تزاحم الإنذارات)
+
+function enqueue(group, fn) {
+    const prev = groupQueues.get(group) || Promise.resolve();
+    const next = prev.then(fn).catch(() => {});
+    groupQueues.set(group, next);
+    next.finally(() => { if (groupQueues.get(group) === next) groupQueues.delete(group); });
+    return next;
+}
+
+export function isDetectorOn(group) {
+    return !!db.detectGroups?.[group];
+}
+
+async function alertDetected(sock, group, memberJid, reason) {
+    const rec = getRecord(memberJid);
+    if (!rec.alertedGroups) rec.alertedGroups = {};
+    if (Date.now() - (rec.alertedGroups[group] || 0) < ALERT_COOLDOWN_MS) return false;
+    rec.alertedGroups[group] = Date.now();
+    rec.status = "review";
+    saveDb();
+
+    // 1) قفل الشات احتياطاً (يحتاج أن يكون البوت مشرفاً)
+    let locked = false;
+    try { await sock.groupSettingUpdate(group, "announcement"); locked = true; } catch {}
+
+    // 2) مشرفو القروب للمنشن
+    let admins = [];
+    try {
+        const meta = await sock.groupMetadata(group);
+        admins = (meta?.participants || [])
+            .filter(p => p.admin)
+            .map(p => p.id)
+            .filter(id => numOf(id) !== selfNumber && numOf(id) !== numOf(memberJid));
+    } catch {}
+
+    const memberTag = `@${numOf(memberJid)}`;
+    const adminTags = admins.length ? admins.map(a => `@${numOf(a)}`).join(" ") : "الأدمن";
+    const lockLine = locked ? "  تم قفل شات القروب احتياطا وحذرا رجاءا" : "";
+
+    const text =
+        `*⌬━─⟐─ ⊱•┇⚠️┇•⊰ ─⟐─━⌬*\n` +
+        `═════════════\n` +
+        `📛_*تحذير هام*_⛔\n` +
+        `═════════════\n` +
+        `تم الكشف عن بوت نشط لدى العضو: \n` +
+        `${memberTag}\n` +
+        `يرجى من ${adminTags}\n` +
+        `التحقق بشأن هذا العضو وعدم ادخاله اي قروب والتعامل معه..${lockLine} \n` +
+        `تعاملو معه وتحققو معه..  تم إرسال \n` +
+        `طلب الى فريق ملوك المجال لوضع \n` +
+        `الرقم تحت الاستهداف في حال فعل شيء سيتم محاولة استهداف رقمه. \n` +
+        `*⌬━─⟐─ ⊱•┇☢️┇•⊰ ─⟐─━⌬*`;
+
+    try {
+        await sock.sendMessage(group, { text, mentions: [memberJid, ...admins] });
+    } catch (e) {
+        console.error("botat: فشل إرسال تحذير الكشف:", e?.message);
+    }
+
+    // 3) تقرير خاص للمالك
+    await notifyOwners(sock,
+        reportText(rec, `🚨 كشف بوت: ${reason}`) + `\n📍 القروب: ${group}\n🔒 القفل: ${locked ? "تم" : "فشل (البوت غير مشرف؟)"}`
+    ).catch(() => {});
+    return true;
+}
+
+async function detectNewMember(sock, group, memberJid) {
+    if (isExemptIn(group, memberJid)) return;
+    const rec = getRecord(memberJid);
+
+    let res = await scanDevices(sock, rec);
+    if (!res.ok) {                       // أحياناً يفشل الاستعلام لحظة الدخول، نعيد مرة واحدة
+        scanCache.delete(rec.jid);
+        await sleep(4000);
+        res = await scanDevices(sock, rec);
+    }
+    rec.level = classify(rec.score);
+    saveDb();
+
+    if (cfg().debug) console.log(`[botat] كاشف ${numOf(memberJid)} في ${group}: ok=${res.ok} linked=${res.count} err=${res.error || "-"}`);
+
+    if (res.ok && res.count >= cfg().detectMinLinked) {
+        await alertDetected(sock, group, memberJid, `${res.count} جهاز مرتبط بالرقم عند الدخول`);
+    }
+}
+
+// ============================================================
 // الإدخال إلى الأساسي
 // ============================================================
 
@@ -487,15 +594,24 @@ export async function onParticipantsUpdate(sock, update) {
 
         // سجل الدخول لكل القروبات (لتحليل الحوادث)
         for (const p of update.participants || []) {
-            db.joinLog.push({ group: update.id, member: normalizeJid(p), by: update.author ? normalizeJid(update.author) : null, at: Date.now() });
+            db.joinLog.push({ group: update.id, member: normalizeJid(toId(p)), by: update.author ? normalizeJid(update.author) : null, at: Date.now() });
         }
         if (db.joinLog.length > 1000) db.joinLog = db.joinLog.slice(-1000);
         saveDb();
 
+        // 🚨 كاشف القروب (.كاشف on): فحص كل عضو جديد فوراً
+        if (isDetectorOn(update.id)) {
+            for (const p of update.participants || []) {
+                const id = toId(p);
+                if (!id) continue;
+                enqueue(update.id, () => detectNewMember(sock, update.id, normalizeJid(id)));
+            }
+        }
+
         if (!c.receptionGroup || update.id !== c.receptionGroup) return;
 
         for (const p of update.participants || []) {
-            const memberJid = normalizeJid(p);
+            const memberJid = normalizeJid(toId(p));
             if (isExempt(memberJid)) continue;
 
             const rec = getRecord(memberJid);
@@ -556,6 +672,9 @@ export async function onMessage(sock, msg) {
                 `${st.dx + st.w > 0 ? "كل رسائله" : ""} من جهاز مرتبط/عميل ويب (${Math.max(st.dx, st.w)} رسالة بدون أي رسالة من الجوال)`);
             if (!rec.devices) await scanDevices(sock, rec);
             rec.level = classify(rec.score);
+            if (isDetectorOn(group) && !isExemptIn(group, participant)) {
+                await alertDetected(sock, group, participant, "كل رسائله من جهاز مرتبط/عميل ويب (سلوك بوت)");
+            }
             if (!rec.alerted) {
                 rec.alerted = true;
                 rec.status = "review";
@@ -642,8 +761,34 @@ export async function handleBotatCommand(ctx) {
     if (command === "كاشف") {
         const v = onOff(args[0]?.toLowerCase());
         if (v === null) return reply("الاستخدام: `.كاشف on` أو `.كاشف off`"), true;
-        db.config.enabled = v; saveDb();
-        return reply(v ? "✅ تم تشغيل كاشف البوتات" : "❌ تم إيقاف كاشف البوتات"), true;
+
+        // خارج القروبات (خاص): مفتاح عام للكاشف كله
+        if (!isGroup) {
+            db.config.enabled = v; saveDb();
+            return reply(v ? "✅ تم تشغيل كاشف البوتات (عام)" : "❌ تم إيقاف كاشف البوتات (عام)"), true;
+        }
+
+        // داخل قروب: تفعيل/إيقاف الكشف لهذا القروب فقط
+        if (v) {
+            db.config.enabled = true;
+            db.detectGroups[jid] = true;
+        } else {
+            delete db.detectGroups[jid];
+        }
+        saveDb();
+
+        if (!v) return reply("❌ تم إيقاف كاشف البوتات في هذا القروب"), true;
+
+        let adminNote = "";
+        try {
+            const meta = await sock.groupMetadata(jid);
+            const me = (meta?.participants || []).find(p => numOf(p.id) === selfNumber);
+            if (!me?.admin) adminNote = "\n⚠️ البوت ليس مشرفاً هنا: سيكشف ويحذّر لكن *لن يستطيع قفل الشات*.";
+        } catch {}
+        return reply(
+            "✅ تم تشغيل كاشف البوتات في هذا القروب\n" +
+            "🕵️ أي عضو جديد يدخل سيُفحص فوراً (أجهزته المرتبطة) حتى لو لم يرسل رسالة." + adminNote
+        ), true;
     }
 
     if (command === "تشخيص_كاشف") {
@@ -675,7 +820,8 @@ export async function handleBotatCommand(ctx) {
         const sus = Object.values(db.members).filter(m => classify(m.score) !== "clear").length;
         return reply(
             `🕵️ *حالة الكاشف*\n` +
-            `التشغيل: ${c.enabled ? "✅" : "❌"}\n` +
+            `التشغيل العام: ${c.enabled ? "✅" : "❌"}\n` +
+            `الكشف في هذا القروب: ${isGroup && isDetectorOn(jid) ? "✅" : "❌"} | قروبات مفعّلة: ${Object.keys(db.detectGroups || {}).length}\n` +
             `الاستقبال: ${c.receptionGroup ? "معيّن" : "غير معيّن"}\n` +
             `الأساسي: ${c.mainGroup ? "معيّن" : "غير معيّن"}\n` +
             `قبول تلقائي: ${c.autoAdmit ? "نعم" : "لا"}\n` +
