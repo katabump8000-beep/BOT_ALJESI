@@ -143,7 +143,10 @@ let db = {
     groupSettings: {},
     reportGroup: null,
     blacklistGroups: [],
-    exceptions: {}
+    exceptions: {},
+    backupGroups: {},      // { groupJid: true } - قروبات النسخ الاحتياطي .حفظ on
+    lastBackupAt: {},      // { groupJid: timestamp } - آخر إرسال للنسخة
+    protectedMembers: {}   // { groupJid: { memberJid: { addedBy, addedAt } } } - حماية .احميه (دائمة)
 };
 
 if (fs.existsSync(dbFile)) {
@@ -415,6 +418,132 @@ function isTrustedSender(jid, sender) {
     return inMap(db.globalAuthorized) || inMap(db.authorizedUsers?.[jid]);
 }
 
+// ============================================================
+// 🛡️ .احميه : حماية إشراف عضو من السحب (دائمة ومحفوظة في database.json)
+// ============================================================
+
+function userKey(jid) {
+    return cleanNumber(String(jid || "").split("@")[0].split(":")[0]);
+}
+
+function getProtectedEntry(groupJid, memberJid) {
+    const g = db.protectedMembers?.[groupJid];
+    if (!g) return null;
+    const k = userKey(memberJid);
+    for (const [j, v] of Object.entries(g)) {
+        if (userKey(j) === k) return { jid: j, ...v };
+    }
+    return null;
+}
+
+function removeProtectedEntry(groupJid, memberJid) {
+    const e = getProtectedEntry(groupJid, memberJid);
+    if (!e) return false;
+    delete db.protectedMembers[groupJid][e.jid];
+    if (Object.keys(db.protectedMembers[groupJid]).length === 0) delete db.protectedMembers[groupJid];
+    saveDb();
+    return true;
+}
+
+// يُستدعى عند أي demote في القروب
+async function handleProtectedDemote(sock, update) {
+    const jid = update.id;
+    const author = update.author;
+    if (!jid || !author || !db.protectedMembers?.[jid]) return;
+
+    const authorNum = userKey(author);
+    if (authorNum === getBotNumber(sock) || getOwnerNumbers().includes(authorNum)) return;
+
+    // المحميّون الذين سُحب إشرافهم (غير المنفّذ نفسه)
+    const victims = [];
+    for (const p of update.participants || []) {
+        const pid = typeof p === "string" ? p : p?.id;
+        if (!pid || userKey(pid) === authorNum) continue;
+        if (getProtectedEntry(jid, pid)) victims.push(pid);
+    }
+    if (!victims.length) return;
+
+    // 1) إرجاع الإشراف للمحمي + 2) سحب إشراف المعتدي (بالتوازي لأقصى سرعة)
+    const [restoreRes, punishRes] = await Promise.allSettled([
+        sock.groupParticipantsUpdate(jid, victims, "promote"),
+        sock.groupParticipantsUpdate(jid, [author], "demote")
+    ]);
+    const punished = punishRes.status === "fulfilled" && String(punishRes.value?.[0]?.status || "200") === "200";
+    const restored = restoreRes.status === "fulfilled";
+
+    // 3) منشن للمشرفين
+    let admins = [];
+    const meta = (await sock.groupMetadata(jid).catch(() => null)) || getCachedMeta(jid);
+    if (meta?.participants) {
+        admins = meta.participants
+            .filter(p => p.admin)
+            .map(p => p.id)
+            .filter(id => userKey(id) !== getBotNumber(sock) && userKey(id) !== authorNum);
+    }
+    const adminTags = admins.length ? admins.map(a => `@${userKey(a)}`).join(" ") : "الأدمن";
+    const victimTags = victims.map(v => `@${userKey(v)}`).join(" ");
+    const authorTag = `@${authorNum}`;
+
+    const verdict = punished
+        ? "لقد تم سحب اشرافك"
+        : "لقد تم إبطال محاولتك" + (restored ? " وإرجاع الاشراف" : "");
+
+    await sock.sendMessage(jid, {
+        text:
+            `◆━─━─━─⊱⛔⊰─━─━─━◆\n` +
+            `${adminTags}\n` +
+            `ايها الرتب هناك من حاول نــزع \n` +
+            `الاشراف من ${victimTags}\n` +
+            `\`المشكوك:\` ${authorTag}\n` +
+            `المدعو ${authorTag}.  ${verdict} \n` +
+            `لأنك حاولت العبث في اشراف شخص\n` +
+            `لديه سلطة عالية وحماية مطلقة. \n` +
+            `◆━─━─━─⊱⚠️⊰─━─━─━◆`,
+        mentions: [...new Set([...admins, ...victims, author])]
+    }).catch(() => {});
+}
+
+// ============================================================
+// 💾 .حفظ on/off : إرسال database.json كملف إلى القروب كل 24 ساعة
+// ============================================================
+
+const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+async function sendBackup(sock, groupJid, reason = "تلقائي") {
+    try {
+        saveDb(); // تأكد أن الملف محدّث قبل الإرسال
+        const buf = fs.readFileSync(dbFile);
+        const stamp = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "-");
+        await sock.sendMessage(groupJid, {
+            document: buf,
+            mimetype: "application/json",
+            fileName: `database-${stamp}.json`,
+            caption:
+                `💾 *نسخة احتياطية لبيانات البوت* (${reason})\n` +
+                `🕒 ${new Date().toLocaleString("ar")}\n` +
+                `📦 الحجم: ${(buf.length / 1024).toFixed(1)} KB\n` +
+                `احتفظ بالملف، وعند الحاجة ضعه باسم database.json بجانب index.js`
+        });
+        if (!db.lastBackupAt) db.lastBackupAt = {};
+        db.lastBackupAt[groupJid] = Date.now();
+        saveDb();
+        return true;
+    } catch (e) {
+        _originalError("❌ فشل إرسال النسخة الاحتياطية:", e?.message);
+        return false;
+    }
+}
+
+async function runBackupCheck() {
+    const sock = currentSock;
+    if (!sock?.user || shuttingDown) return;
+    for (const g of Object.keys(db.backupGroups || {})) {
+        if (!db.backupGroups[g]) continue;
+        const last = db.lastBackupAt?.[g] || 0;
+        if (Date.now() - last >= BACKUP_INTERVAL_MS) await sendBackup(sock, g);
+    }
+}
+
 const contactHooks = {
     getReportGroups: () => (Array.isArray(db.blacklistGroups) ? db.blacklistGroups : []),
     getGroupName: async (jid) => (await getGroupMetaFast(currentSock, jid))?.subject
@@ -544,7 +673,7 @@ async function startBot() {
                 reconnectAttempts = 0;
                 lastActivityAt = Date.now();
                 startWatchdog();
-                initBotat({ owners: getOwnerNumbers(), botNumber: getBotNumber(sock) });
+                initBotat({ owners: getOwnerNumbers(), botNumber: getBotNumber(sock), isTrusted: isTrustedSender });
                 warmGroupCache(sock);
                 _originalLog("✅ تم اتصال البوت بنجاح!");
                 return;
@@ -598,6 +727,12 @@ async function startBot() {
                 // 🕵️ كاشف البوتات (فحص الأعضاء الجدد في الاستقبال + سجل الدخول)
                 if (update.action === "add") {
                     botatOnParticipants(sock, update).catch(() => {});
+                }
+
+                // 🛡️ .احميه : أي محاولة سحب إشراف عضو محمي
+                if (update.action === "demote") {
+                    await handleProtectedDemote(sock, update).catch(e =>
+                        _originalError("Protected demote error:", e?.message));
                 }
 
                 if (settingsJid.leave && update.action === "remove") {
@@ -915,6 +1050,41 @@ async function handleCommands(ctx) {
     // 🕵️ أوامر كاشف البوتات
     if (await handleBotatCommand({ ...ctx })) return;
 
+    // 💾 .حفظ on/off : النسخ الاحتياطي لقاعدة البيانات إلى هذا القروب (للمالك فقط)
+    if (command === "حفظ" && getMessageText(msg).trim().startsWith(".")) {
+        await deleteCommandMessage();
+        if (!isGroup) return;
+        if (!isOwner) {
+            await sock.sendMessage(jid, {
+                text: decorateError("حفظ", "⚠️ أمر `.حفظ` خاص بالمالك الأساسي فقط.")
+            });
+            return;
+        }
+        if (!db.backupGroups) db.backupGroups = {};
+        const action = args[0]?.toLowerCase();
+
+        if (action === "on") {
+            db.backupGroups[jid] = true;
+            saveDb();
+            await sock.sendMessage(jid, {
+                text: decorateSuccess("حفظ البيانات", "💾 تم تفعيل الحفظ في هذا القروب ✅\n📤 سيصل ملف database.json كل 24 ساعة (والنسخة الأولى الآن)")
+            });
+            await sendBackup(sock, jid, "أول نسخة");
+        } else if (action === "off") {
+            delete db.backupGroups[jid];
+            if (db.lastBackupAt) delete db.lastBackupAt[jid];
+            saveDb();
+            await sock.sendMessage(jid, {
+                text: decorateError("حفظ البيانات", "❌ تم إيقاف الحفظ التلقائي في هذا القروب.")
+            });
+        } else {
+            await sock.sendMessage(jid, {
+                text: decorateInfo("استخدام الأمر", "⚠️ الاستخدام:\n.حفظ on\n.حفظ off")
+            });
+        }
+        return;
+    }
+
     // 📋 .قائمة on/off : تعيين هذا الجروب لاستقبال استمارات المؤبدين
     if ((command === "قائمة" || command === "القائمة") && getMessageText(msg).trim().startsWith(".")) {
         await deleteCommandMessage();
@@ -1030,7 +1200,8 @@ async function handleCommands(ctx) {
             `📌 *أوامر الإدارة:*\n` +
             `├ .قفل\n├ .فتح\n├ .ترقية @عضو\n├ .إعفاء @عضو\n` +
             `├ .اشرافه @عضو 🛡️\n├ .الغاء_اشرافه @عضو\n` +
-            `├ .سحب صلاحيات @عضو\n├ .قائمة on/off\n` +
+            `├ .احميه @عضو 🛡️ (حماية إشرافه من السحب)\n├ .الغاء_احميه @عضو\n` +
+            `├ .سحب صلاحيات @عضو\n├ .قائمة on/off\n├ .حفظ on/off 💾\n` +
             `├ .معلومات\n├ .استثناء @عضو\n\n` +
             `🛡️ *الحماية والمراقبة:*\n` +
             `├ .حماية on/off\n├ .مراقبة on/off\n├ .مغادرة on/off\n` +
@@ -1267,6 +1438,78 @@ async function handleCommands(ctx) {
         return;
     }
 
+    // 8b. احميه : حماية إشراف العضو من السحب (يُرجع إشرافه ويسحب إشراف المعتدي)
+    if (command === "احميه" || command === "احمية") {
+        if (!getMessageText(msg).trim().startsWith(".")) return;
+        await deleteCommandMessage();
+        if (!isGroup) return;
+        if (!isOwner && !hasLocalAccess) {
+            await sock.sendMessage(jid, {
+                text: decorateError("صلاحيات", "⚠️ هذا الأمر مخصص للجهات العليا فقط.")
+            });
+            return;
+        }
+
+        let target = mentioned[0] || msg.message?.extendedTextMessage?.contextInfo?.participant;
+        if (!target) {
+            const digits = cleanNumber(args.find(a => cleanNumber(a).length >= 7) || "");
+            if (digits) target = `${digits}@s.whatsapp.net`;
+        }
+        if (!target) {
+            await sock.sendMessage(jid, {
+                text: decorateInfo("استخدام الأمر", "⚠️ الاستخدام:\n` .احميه @user `")
+            });
+            return;
+        }
+
+        if (!db.protectedMembers) db.protectedMembers = {};
+        if (!db.protectedMembers[jid]) db.protectedMembers[jid] = {};
+        const old = getProtectedEntry(jid, target);
+        if (old) delete db.protectedMembers[jid][old.jid];
+        db.protectedMembers[jid][target] = { addedBy: sender, addedAt: Date.now() };
+        saveDb();
+
+        let note = "";
+        const meta = await sock.groupMetadata(jid).catch(() => null);
+        if (meta?.participants) {
+            const me = meta.participants.find(p => userKey(p.id) === getBotNumber(sock));
+            const him = meta.participants.find(p => userKey(p.id) === userKey(target));
+            if (!me?.admin) note += "\n⚠️ البوت ليس مشرفاً: لن يستطيع إرجاع الاشراف أو سحبه من المعتدي!";
+            if (!him?.admin) note += "\nℹ️ العضو ليس مشرفاً حالياً، الحماية تسري متى ما صار مشرفاً.";
+        }
+
+        await sock.sendMessage(jid, {
+            text:
+                `◆━─━─━─⊱🛡️⊰─━─━─━◆\n` +
+                `تم تفعيل الحماية المطلقة للعضو @${userKey(target)}\n` +
+                `${DECOR.sep}\n` +
+                `🚫 أي شخص يحاول سحب اشرافه\n` +
+                `↩️ يرجع الاشراف للمحمي فوراً\n` +
+                `📉 ويُسحب اشراف المعتدي\n` +
+                `◆━─━─━─⊱✅⊰─━─━─━◆` + note,
+            mentions: [target]
+        });
+        return;
+    }
+
+    // 8c. إلغاء الحماية
+    if (command === "الغاء_احميه" || command === "الغاء_حمايه" || command === "الغاء_حماية") {
+        if (!getMessageText(msg).trim().startsWith(".")) return;
+        await deleteCommandMessage();
+        if (!isGroup || (!isOwner && !hasLocalAccess)) return;
+        const target = mentioned[0] || msg.message?.extendedTextMessage?.contextInfo?.participant;
+        if (!target) return;
+        const was = removeProtectedEntry(jid, target);
+        await sock.sendMessage(jid, {
+            text: decorateSuccess(
+                "إلغاء الحماية",
+                was ? `🔓 تم إلغاء الحماية عن @${userKey(target)}` : `ℹ️ @${userKey(target)} ليس محمياً`
+            ),
+            mentions: [target]
+        });
+        return;
+    }
+
     // 9. إلغاء اشرافه
     if (command === "الغاء_اشرافه" || command === "إلغاء_إشرافه") {
         await deleteCommandMessage();
@@ -1468,6 +1711,11 @@ async function main() {
         cleanupInterval = setInterval(runCleanup, 10 * 60 * 1000);
 
         setTimeout(runCleanup, 30 * 1000);
+
+        // فحص النسخ الاحتياطي كل 30 دقيقة (يرسل فقط إذا مضت 24 ساعة على آخر نسخة، فلا يتكرر عند إعادة التشغيل)
+        const backupTimer = setInterval(() => runBackupCheck().catch(() => {}), 30 * 60 * 1000);
+        backupTimer.unref?.();
+        setTimeout(() => runBackupCheck().catch(() => {}), 90 * 1000);
 
         await startBot();
     } catch (e) {
