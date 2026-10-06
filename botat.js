@@ -1,15 +1,18 @@
-// botat.js - كاشف حسابات البوتات لقروب الاستقبال (ESM - Baileys 6.7.9)
+// botat.js - كاشف البوتات الجيل الثاني (ESM - Baileys 6.7.x)
 //
-// الفكرة: كل عضو جديد في "الاستقبال" يُجمع له نقاط شك من عدة إشارات،
-// وبعدها يُقبل أو يُحوَّل لمراجعة المالك. لا يوجد طرد تلقائي أبداً.
+// الفلسفة الجديدة: لا إشارة واحدة تحكم. كل عضو يُجمع له 13 إشارة من
+// 4 طبقات مستقلة، ولا يُحسم الحكم إلا بتقاطع الإشارات:
 //
-// الإشارات:
-//   1) الأجهزة المرتبطة للرقم (getUSyncDevices)         -> ضعيفة/متوسطة (واتساب ويب يظهر بنفس الشكل)
-//   2) جهاز الإرسال عند تنفيذ المهمة (device في participant) -> متوسطة
-//   3) بصمة معرّف الرسالة (key.id)                        -> ضعيفة (تحتاج معايرة بوضع التشخيص)
-//   4) فخ الإيصالات: قراءة فورية لرسالة الترحيب            -> متوسطة عند التكرار
-//   5) تفاعل/رد فوري غير مطلوب بعد رسالة الترحيب          -> متوسطة
-//   + سجل دخول (من أضاف من ومتى) لتحليل الحوادث لاحقاً
+//   الطبقة 0) الأجهزة (USync): الأجهزة المرتبطة + أرشيف أرقام الأجهزة
+//   الطبقة 1) بصمة الرسالة: BAE5 (توقيع Baileys) / 3EB0 / هكس-32 / مختلط
+//   الطبقة 2) الحضور (presence): البومة الليلية، المراقب الصامت
+//   الطبقة 3) السلوك: غياب الكتابة، الإيقاع الآلي، انعدام الإيصالات
+//
+// الجديد مقارنة بالجيل الأول:
+//   ✦ حل مشكلة LID (أغلب الداخلين الجدد كانوا يفشلون فوراً)
+//   ✦ BAE5 صار هو الإشارة الأقوى بدل 3EB0 (3EB0 = واتساب ويب الرسمي أيضاً)
+//   ✦ إلغاء الاعتماد على "القراءة الفورية" كدليل (دقتها بالثواني = ضعيفة)
+//   ✦ إشارات سلوكية يستحيل على البوت تقليدها كلها معاً
 
 import fs from "node:fs";
 import path from "node:path";
@@ -19,29 +22,39 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_FILE = path.join(__dirname, "botat-db.json");
 
 // ============================================================
-// الإعدادات الافتراضية (تُحفظ وتتعدل بالأوامر)
+// الإعدادات الافتراضية
 // ============================================================
 
 const DEFAULT_CONFIG = {
     enabled: true,
-    receptionGroup: null,      // يُضبط بالأمر .تعيين_استقبال
-    mainGroup: null,           // يُضبط بالأمر .تعيين_اساسي
-    autoAdmit: false,          // قبول تلقائي للحالات النظيفة (مطفأ افتراضياً)
-    requireTask: true,         // لا قبول تلقائي قبل ما ينفذ العضو المهمة (رسالة)
-    debug: false,              // يطبع بصمات الرسائل للمعايرة
-    thresholds: { review: 3, high: 6 },
-    finalizeAfterMs: 3 * 60 * 1000,   // مهلة الحكم النهائي بعد الدخول
-    quickReadMs: 2500,                // القراءة الأسرع من هذا تعتبر آلية
-    quickReplyMs: 2500,               // تفاعل خلال هذه المدة بعد الترحيب يعتبر آلياً
-    detectMinLinked: 1,               // أقل عدد أجهزة مرتبطة يُعتبر كشفاً في القروبات المفعّل فيها .كاشف
+    receptionGroup: null,
+    mainGroup: null,
+    autoAdmit: false,
+    requireTask: true,
+    debug: false,
+    thresholds: { review: 7, high: 14 },
+    finalizeAfterMs: 5 * 60 * 1000,
+    quickReadMs: 2500,
+    quickReplyMs: 2000,
+    detectMinLinked: 1,
     taskText: "اكتب كلمة *تم* هنا للتوثيق ✅",
     points: {
-        linked1: 3,        // جهاز مرتبط واحد => مراجعة مباشرة (بوت أو ويب)
-        linked2: 4,        // جهازان مرتبطان أو أكثر
-        msgDevice: 2,      // أرسل رسالة من جهاز غير 0
-        idBaeSig: 3,       // معرّف يبدأ BAE5 (توقيع Baileys قديم)
-        idWebSig: 1,       // معرّف يبدأ 3EB0 (نمط عميل ويب/مكتبة، وليس تطبيق الجوال)
-        companionOnly: 3,  // لا يرسل إلا من جهاز مرتبط/عميل ويب (سلوك بوت)
+        linked1: 4,         // جهاز مرتبط واحد (بوت أو ويب — يُفسر مع باقي الإشارات)
+        linked2: 5,         // جهازان مرتبطان أو أكثر
+        deviceAged: 4,      // رقم جهاز ≥ 15 = جلسات ربط كثيرة (استضافة بوتات)
+        multiCompanion: 3,  // 3+ أجهزة مرتبطة
+        msgDevice: 2,       // نفّذ المهمة من جهاز مرتبط
+        idBaeSig: 6,        // توقيع Baileys المباشر (BAE5 + 16 هكس) — شبه مؤكد
+        idWebSig: 3,        // نمط 3EB0 (ويب رسمي أو مكتبة)
+        idHex32: 3,         // معرّف 32 خانة هكس نقية (نمط مكتبات)
+        companionOnly: 4,   // لا يرسل إلا من جهاز مرتبط أبداً
+        noTyping: 1,        // رسالة بدون مؤشر كتابة (يشطب بعد 3 متتالية)
+        noTypingPattern: 4, // 5+ رسائل ولا مرة واحدة "يكتب الآن" — بشر شبه مستحيل
+        machineCadence: 4,  // فواصل زمنية شبه ثابتة (CV < 0.25) — حلقة تكرار
+        receiptVoid: 4,     // 6+ رسائل مرسلة وصفر إيصالات طوال اليوم (Baileys افتراضياً بلا إيصالات)
+        nightOwl: 3,        // حضور متكرر أونلاين بين 3-6 فجراً
+        silentWatcher: 3,   // 10+ أحداث حضور وصفر رسائل — بوت رصد/سحب صامت
+        taskReplyNoType: 3, // رد "تم" خلال 1.5 ثانية بدون أي مؤشر كتابة
         quickRead1: 1,
         quickReadRepeat: 2,
         autoReaction: 3
@@ -52,7 +65,7 @@ const DEFAULT_CONFIG = {
 // التخزين
 // ============================================================
 
-let db = { config: {}, members: {}, joinLog: [], detectGroups: {} };
+let db = { config: {}, members: {}, joinLog: [], detectGroups: {}, stats: {}, lidMap: {} };
 
 try {
     if (fs.existsSync(DB_FILE)) {
@@ -73,6 +86,13 @@ function saveDb() {
     }
 }
 
+let saveTimer = null;
+function saveDbSoon() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => { saveTimer = null; saveDb(); }, 5000);
+    saveTimer.unref?.();
+}
+
 function cfg() {
     return {
         ...DEFAULT_CONFIG,
@@ -88,11 +108,12 @@ function cfg() {
 
 let ownerNumbers = [];
 let selfNumber = "";
-const baits = new Map();          // messageId -> { sentAt, group }
-const finalizeTimers = new Map(); // memberKey -> timeout
-const scanCache = new Map();      // memberKey -> { at, result }
+const baits = new Map();
+const finalizeTimers = new Map();
+const scanCache = new Map();       // jid -> { at, result }
 const SCAN_CACHE_MS = 5 * 60 * 1000;
 const MAX_BAITS = 300;
+const PRESENCE_WATCH_MS = 15 * 60 * 1000; // مدة مراقبة الحضور بعد الدخول
 
 let trustedHook = () => false;
 
@@ -132,21 +153,42 @@ function isExempt(jid) {
     return !n || n === selfNumber || ownerNumbers.includes(n);
 }
 
-// مستثنى داخل قروب معيّن (المالك + البوت + أصحاب الصلاحيات في البوت)
 function isExemptIn(group, jid) {
     if (isExempt(jid)) return true;
     try { return !!trustedHook(group, jid); } catch { return false; }
+}
+
+// الحل الجذري لمشكلة LID: نحاول دائماً الوصول للرقم الحقيقي
+// (تحتاج تفعيل lidMapping: true في إعدادات السوكت — انظر ملاحظات index.js)
+function resolvePhoneJid(jid) {
+    const s = String(jid || "");
+    if (!s.includes("@lid")) return s;
+    const mapped = db.lidMap?.[s];
+    return mapped || s;
+}
+
+function rememberLidMapping(lidJid, phoneJid) {
+    if (!lidJid || !phoneJid) return;
+    if (!String(lidJid).includes("@lid")) return;
+    if (!db.lidMap) db.lidMap = {};
+    if (db.lidMap[lidJid] !== phoneJid) {
+        db.lidMap[lidJid] = phoneJid;
+        if (Object.keys(db.lidMap).length > 3000) {
+            delete db.lidMap[Object.keys(db.lidMap)[0]];
+        }
+        saveDbSoon();
+    }
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const toId = (p) => (typeof p === "string" ? p : p?.id || "");
 
 // ============================================================
-// سجل العضو + النقاط
+// سجل العضو
 // ============================================================
 
 function getRecord(jid, create = true) {
-    const key = normalizeJid(jid);
+    const key = normalizeJid(resolvePhoneJid(jid));
     if (!db.members[key] && create) {
         db.members[key] = {
             jid: key,
@@ -156,7 +198,7 @@ function getRecord(jid, create = true) {
             signals: {},
             score: 0,
             level: "clear",
-            status: "pending",      // pending | waiting | clear | review | admitted | blocked
+            status: "pending",
             taskDone: false,
             quickReads: 0,
             devices: null,
@@ -168,36 +210,69 @@ function getRecord(jid, create = true) {
 }
 
 // ============================================================
-// 📈 إحصاءات السلوك عبر كل القروبات (أقوى دليل على بوت نشط)
-// الإنسان يرسل غالباً من جواله (device 0)، أما البوت فلا يرسل إلا من جهاز مرتبط
+// 📈 إحصاءات السلوك والحضور (عبر كل القروبات)
 // ============================================================
 
-if (!db.stats) db.stats = {};
-if (!db.detectGroups || typeof db.detectGroups !== "object") db.detectGroups = {};
-let saveTimer = null;
-function saveDbSoon() {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => { saveTimer = null; saveDb(); }, 5000);
-    saveTimer.unref?.();
+const COMPANION_MIN_MSGS = 5;
+
+function getStats(num, create = true) {
+    const now = Date.now();
+    const st = db.stats[num];
+    if (st) return st;
+    if (!create) return null;
+    return (db.stats[num] = {
+        d0: 0, dx: 0, w: 0, o: 0,        // أجهزة الإرسال + نمط المعرّف
+        ids: [],                          // آخر 5 معرّفات
+        msgs: 0,                          // عدد الرسائل الكلي
+        noType: 0, typed: 0,              // رسائل بلا/مع مؤشر كتابة
+        lastTypingAt: 0,
+        intervals: [],                    // آخر 12 فاصل زمني (ذاكرة فقط)
+        lastMsgAt: 0, firstMsgAt: 0,
+        receipts: 0,                      // عدد إيصالات القراءة التي أرسلها
+        onlineEvents: 0, nightOnline: 0,  // حضور + حضور ليلي
+        lastPresence: null,
+        subscribedAt: 0,
+        first: now, last: now
+    });
 }
 
-const COMPANION_MIN_MSGS = 6;
-
 function observeSender(num, ka) {
+    const st = getStats(num);
     const now = Date.now();
-    const st = db.stats[num] || (db.stats[num] = { d0: 0, dx: 0, w: 0, o: 0, ids: [], first: now, last: now });
     if (ka.device > 0) st.dx++; else st.d0++;
     if (/^3EB0/i.test(ka.id)) st.w++; else st.o++;
     st.ids.push(ka.id);
     if (st.ids.length > 5) st.ids.shift();
     st.last = now;
-
-    const keys = Object.keys(db.stats);
-    if (keys.length > 4000) {
-        keys.sort((a, b) => db.stats[a].last - db.stats[b].last);
-        for (const k of keys.slice(0, 500)) delete db.stats[k];
-    }
     return st;
+}
+
+// ✍️ تحليل "الكتابة": هل سبق الرسالة مؤشر composing خلال 8 ثوانٍ؟
+function observeTyping(num, msgKeyId) {
+    const st = getStats(num, false);
+    if (!st) return;
+    const now = Date.now();
+    const hadTyping = st.lastTypingAt && (now - st.lastTypingAt) < 8000;
+    if (hadTyping) { st.typed++; st.noType = 0; }
+    else { st.noType++; }
+    if (st.intervals && st.lastMsgAt && now - st.lastMsgAt < 60000) {
+        st.intervals.push(now - st.lastMsgAt);
+        if (st.intervals.length > 12) st.intervals.shift();
+    }
+    st.lastMsgAt = now;
+    if (!st.firstMsgAt) st.firstMsgAt = now;
+}
+
+// ⏱️ الإيقاع الآلي: معامل الاختلاف (CV) للفواصل الزمنية
+// البشر عشوائيون (CV مرتفع)، حلقات البوت شبه ثابتة (CV < 0.25)
+function cadenceIsMachine(st) {
+    const iv = (st.intervals || []).slice(-8);
+    if (iv.length < 6) return false;
+    const mean = iv.reduce((a, b) => a + b, 0) / iv.length;
+    if (mean < 1200 || mean > 30000) return false; // خارج النطاق = لا حكم
+    const variance = iv.reduce((a, b) => a + (b - mean) ** 2, 0) / iv.length;
+    const cv = Math.sqrt(variance) / mean;
+    return cv < 0.25;
 }
 
 function isCompanionOnly(st) {
@@ -220,8 +295,63 @@ export function classify(score) {
 
 const LEVEL_LABEL = { clear: "🟢 نظيف", review: "🟡 مراجعة", high: "🔴 شك عالٍ" };
 
+function botPercent(score) {
+    return Math.min(99, Math.round((score / cfg().thresholds.high) * 100));
+}
+
 // ============================================================
-// (1) الأجهزة المرتبطة - getUSyncDevices
+// (الطبقة 2) 👁 الحضور والكتابة — presence.update
+// يُرسل من index.js: sock.ev.on("presence.update", ...)
+// ============================================================
+
+export async function onPresence(sock, update) {
+    try {
+        if (!cfg().enabled) return;
+        for (const p of update?.presences || []) {
+            const jid = resolvePhoneJid(p?.id);
+            const num = numOf(jid);
+            if (!num || isExempt(jid)) continue;
+
+            const st = getStats(num);
+            const now = Date.now();
+            const pres = p.lastKnownPresence;
+
+            if (pres === "composing" || pres === "recording") {
+                st.lastTypingAt = now;           // ← الذهب: البشر يكتبون قبل ما يرسلون
+            } else if (pres === "available") {
+                st.onlineEvents++;
+                const h = new Date().getHours();
+                if (h >= 3 && h <= 6) st.nightOnline++;   // 🌙 البومة الليلية
+            }
+            st.lastPresence = pres || "unavailable";
+            st.last = now;
+
+            // إشارات قابلة للتفعيل فوراً
+            const rec = getRecord(jid, false);
+            if (rec && !rec.signals.silentWatcher && st.onlineEvents >= 10 && st.msgs === 0) {
+                setSignal(rec, "silentWatcher", cfg().points.silentWatcher,
+                    `حضور متكرر (${st.onlineEvents} مرة) بدون أي رسالة — مراقب صامت`);
+                evaluate(sock, rec, { final: false }).catch(() => {});
+            }
+        }
+        saveDbSoon();
+    } catch (e) {
+        console.error("botat onPresence:", e?.message);
+    }
+}
+
+// نطلب الاشتراك بحضور العضو الجديد فور دخوله (يتطلب أن يكون الرقم بين جهات اتصال
+// البوت أو أن يكونوا متفاعلين — نجرب وإن فشل لا ضرر)
+function watchPresence(sock, jid) {
+    try {
+        const st = getStats(numOf(jid), false);
+        if (st) st.subscribedAt = Date.now();
+        sock.presenceSubscribe?.(normalizeJid(resolvePhoneJid(jid))).catch(() => {});
+    } catch {}
+}
+
+// ============================================================
+// (الطبقة 0) الأجهزة المرتبطة - getUSyncDevices مع إعادة محاولة ذكية
 // ============================================================
 
 function withTimeout(promise, ms) {
@@ -231,42 +361,30 @@ function withTimeout(promise, ms) {
     ]);
 }
 
-// يرجع { ok, count, devices:[ids], method, error }
+// يرجع { ok, count, devices:[ids], maxId, method, error }
 export async function getLinkedDevices(sock, memberJid) {
-    const p = parseJid(memberJid);
+    const resolved = resolvePhoneJid(memberJid);
+    const p = parseJid(resolved);
     if (p.server !== "s.whatsapp.net") {
-        return { ok: false, count: 0, devices: [], error: "الحساب بصيغة LID غير مدعومة في هذه النسخة" };
+        return { ok: false, count: 0, devices: [], maxId: 0, error: "معرّف LID بلا رقم معروف بعد (فعّل lidMapping أو انتظر أول رسالة منه)" };
     }
     const userJid = `${p.user}@s.whatsapp.net`;
 
     try {
-        // المسار الأساسي: getUSyncDevices(jids, useCache, ignoreZeroDevices)
         if (typeof sock.getUSyncDevices === "function") {
             const list = await withTimeout(sock.getUSyncDevices([userJid], false, false), 20000);
             const ids = (Array.isArray(list) ? list : [])
-                .map(d => (typeof d?.device === "number" ? d.device : parseJid(d?.jid).device));
-            if (!ids.length) return { ok: false, count: 0, devices: [], method: "getUSyncDevices", error: "لم تُرجَع أجهزة (الرقم غير مسجل أو فشل الاستعلام)" };
-            const linked = ids.filter(id => id > 0);
-            return { ok: true, count: linked.length, devices: ids, method: "getUSyncDevices" };
-        }
-
-        // مسار احتياطي: executeUSyncQuery
-        if (typeof sock.executeUSyncQuery === "function") {
-            const B = await import("@whiskeysockets/baileys");
-            const lib = { ...(B.default || {}), ...B };
-            if (lib.USyncQuery && lib.USyncUser) {
-                const q = new lib.USyncQuery().withDeviceProtocol().withUser(new lib.USyncUser().withId(userJid));
-                const res = await withTimeout(sock.executeUSyncQuery(q), 20000);
-                const item = res?.list?.[0];
-                const raw = item?.devices?.deviceList || item?.devices || [];
-                const ids = (Array.isArray(raw) ? raw : []).map(d => (typeof d?.id === "number" ? d.id : 0));
-                if (!ids.length) return { ok: false, count: 0, devices: [], method: "executeUSyncQuery", error: "نتيجة فارغة" };
-                return { ok: true, count: ids.filter(i => i > 0).length, devices: ids, method: "executeUSyncQuery" };
+                .map(d => (typeof d?.device === "number" ? d.device : parseJid(d?.jid).device))
+                .filter(n => Number.isFinite(n));
+            if (!ids.length) {
+                return { ok: false, count: 0, devices: [], maxId: 0, method: "getUSyncDevices", error: "لم تُرجَع أجهزة (الاستعلام رُفض أو الحساب غير ظاهر حالياً)" };
             }
+            const linked = ids.filter(id => id > 0);
+            return { ok: true, count: linked.length, devices: ids, maxId: Math.max(...ids), method: "getUSyncDevices" };
         }
-        return { ok: false, count: 0, devices: [], error: "لا getUSyncDevices ولا executeUSyncQuery في هذه النسخة" };
+        return { ok: false, count: 0, devices: [], maxId: 0, error: "getUSyncDevices غير متوفر في هذه النسخة" };
     } catch (e) {
-        return { ok: false, count: 0, devices: [], error: e?.message || String(e) };
+        return { ok: false, count: 0, devices: [], maxId: 0, error: e?.message || String(e) };
     }
 }
 
@@ -277,10 +395,19 @@ async function scanDevices(sock, rec) {
     if (cached && Date.now() - cached.at < SCAN_CACHE_MS) {
         res = cached.result;
     } else {
-        res = await getLinkedDevices(sock, rec.jid);
+        // إعادة محاولة حتى 3 مرات مع تراجع أسّي — الاستعلام يفشل كثيراً لحظة الدخول
+        let lastErr = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            res = await getLinkedDevices(sock, key);
+            if (res.ok) break;
+            lastErr = res.error;
+            const wait = (/rate|overlimit|limit/i.test(lastErr || "")) ? 30000 : 4000 * (attempt + 1);
+            if (cfg().debug) console.log(`[botat] فحص ${key} فشل (محاولة ${attempt + 1}/3): ${lastErr} — انتظار ${wait}ms`);
+            await sleep(wait);
+        }
         scanCache.set(key, { at: Date.now(), result: res });
     }
-    rec.devices = { ok: res.ok, count: res.count, list: res.devices, method: res.method || null, error: res.error || null, at: Date.now() };
+    rec.devices = { ok: res.ok, count: res.count, list: res.devices, maxId: res.maxId || 0, method: res.method || null, error: res.error || null, at: Date.now() };
 
     const P = cfg().points;
     if (res.ok && res.count >= 2) {
@@ -291,37 +418,54 @@ async function scanDevices(sock, rec) {
         delete rec.signals.linkedDevices;
         rec.score = Object.values(rec.signals).reduce((a, s) => a + s.points, 0);
     }
+
+    // 🏛 أرشيف الأجهزة: أرقام عالية = جلسات ربط كثيرة = استضافة بوتات
+    if (res.ok && res.maxId >= 15) {
+        setSignal(rec, "deviceAged", P.deviceAged, `أرقام أجهزة مرتفعة (حتى device ${res.maxId}) = تاريخ ربط جلسات كثير`);
+    }
+    if (res.ok && res.count >= 3) {
+        setSignal(rec, "multiCompanion", P.multiCompanion, `${res.count} أجهزة مرتبطة معاً`);
+    }
     return res;
 }
 
 // ============================================================
-// (2)+(3) جهاز الإرسال وبصمة المعرّف
+// (2) الحضور: يجب تمرير presence.update من index.js
 // ============================================================
 
-export function analyzeKey(key) {
-    const id = String(key?.id || "");
-    const device = parseJid(key?.participant || "").device;
-    const P = cfg().points;
-    const found = [];
+export async function onPresence(sock, update) {
+    try {
+        if (!cfg().enabled) return;
+        for (const p of update?.presences || []) {
+            const jid = normalizeJid(resolvePhoneJid(p?.id));
+            const key = normalizeJid(jid);
+            const scan = activeScans.get(key);
+            if (!scan || scan.done) continue;
 
-    if (device > 0) {
-        found.push({ key: "msgDevice", points: P.msgDevice, reason: `نفّذ المهمة من جهاز مرتبط (device ${device})` });
+            if (p.lastKnownPresence === "available") {
+                scan.presences++;
+                const h = new Date().getHours();
+                const rec = getRecord(jid, false);
+                if (rec && !rec.signals.nightOwl && h >= 3 && h <= 6) {
+                    setSignal(rec, "nightOwl", cfg().points.nightOwl, `ظهر أونلاين الساعة ${h} فجراً بدون أي تفاعل — بوت متصل دائماً`);
+                }
+                if (rec && !rec.signals.instantOnline && Date.now() - scan.startedAt < 10000) {
+                    setSignal(rec, "instantOnline", cfg().points.instantOnline, "أونلاين خلال ثوانٍ من دخوله دون أي تفاعل");
+                }
+            }
+        }
+    } catch (e) {
+        console.error("botat onPresence:", e?.message);
     }
-    if (/^BAE5/i.test(id)) {
-        found.push({ key: "idFingerprint", points: P.idBaeSig, reason: `معرّف الرسالة بتوقيع BAE5 (${id.length} حرف)` });
-    } else if (/^3EB0/i.test(id)) {
-        found.push({ key: "idFingerprint", points: P.idWebSig, reason: `معرّف بنمط عميل ويب/مكتبة 3EB0 (${id.length} حرف)` });
-    }
-    return { id, device, found };
 }
 
 // ============================================================
-// (4) فخ الإيصالات + رسالة الترحيب (تعمل كمهمة وكطُعم)
+// (3) فخ الإيصال: قراءة فورية لرسالة الترحيب = قارئ آلي
 // ============================================================
 
 async function sendWelcomeBait(sock, memberJid) {
     const c = cfg();
-    if (!c.receptionGroup) return;
+    if (!c.receptionGroup) return null;
     const tag = `@${numOf(memberJid)}`;
     try {
         const sent = await sock.sendMessage(c.receptionGroup, {
@@ -330,49 +474,92 @@ async function sendWelcomeBait(sock, memberJid) {
         });
         const id = sent?.key?.id;
         if (id) {
-            baits.set(id, { sentAt: Date.now(), group: c.receptionGroup });
+            baits.set(id, { sentAt: Date.now(), group: c.receptionGroup, memberJid: normalizeJid(memberJid) });
             if (baits.size > MAX_BAITS) baits.delete(baits.keys().next().value);
         }
-        const rec = getRecord(memberJid);
-        rec.baitSentAt = Date.now();
-        saveDb();
+        return id;
     } catch (e) {
         console.error("botat: فشل إرسال الترحيب:", e?.message);
+        return null;
     }
 }
 
-// حدث message-receipt.update: [{ key, receipt:{ userJid, readTimestamp } }]
 export async function onReceipt(sock, updates) {
     try {
-        const c = cfg();
-        if (!c.enabled || !Array.isArray(updates)) return;
-
+        if (!cfg().enabled || !Array.isArray(updates)) return;
         for (const u of updates) {
             const bait = baits.get(u?.key?.id);
             if (!bait) continue;
             const r = u.receipt || {};
-            const reader = r.userJid;
+            const reader = normalizeJid(resolvePhoneJid(r.userJid));
             if (!reader || !r.readTimestamp || isExempt(reader)) continue;
 
-            const readMs = Number(r.readTimestamp) * 1000;   // الدقة بالثواني فقط
-            const delay = readMs - bait.sentAt;
-            if (c.debug) console.log(`[botat] قراءة ${numOf(reader)} بعد ${delay}ms`);
-            if (delay > c.quickReadMs) continue;
+            const delay = Number(r.readTimestamp) * 1000 - bait.sentAt;
+            if (cfg().debug) console.log(`[botat] قراءة ${numOf(reader)} بعد ${delay}ms`);
+            if (delay < 0 || delay > cfg().quickReadMs) continue;
 
             const rec = getRecord(reader, false);
             if (!rec) continue;
-            rec.quickReads = (rec.quickReads || 0) + 1;
-            if (rec.quickReads === 1) {
-                setSignal(rec, "quickRead", c.points.quickRead1, "قراءة فورية لرسالة الترحيب");
-            } else {
-                setSignal(rec, "quickRead", c.points.quickReadRepeat, `قراءة فورية متكررة (${rec.quickReads} مرات)`);
-            }
+            setSignal(rec, "quickRead", cfg().points.quickRead,
+                `قرأ رسالة الترحيب خلال ${Math.max(0, Math.round(delay / 100) / 10)} ثانية (قارئ آلي)`);
             await evaluate(sock, rec, { final: false });
         }
-        saveDb();
     } catch (e) {
         console.error("botat onReceipt:", e?.message);
     }
+}
+
+// ============================================================
+// ⏱ الروتين المركزي: فحص كامل خلال 60 ثانية من الدخول
+// ============================================================
+
+async function runJoinScan(sock, group, memberJid, addedBy) {
+    const key = normalizeJid(memberJid);
+    const rec = getRecord(memberJid);
+    rec.joinedAt = Date.now();
+    rec.addedBy = addedBy ? normalizeJid(addedBy) : null;
+    rec.status = "scanning";
+    rec.alerted = false;
+    saveDb();
+
+    const scan = { startedAt: Date.now(), presences: 0, done: false };
+    activeScans.set(key, scan);
+
+    // 1) اشتراك الحضور فوراً (قبل كل شيء — نريد أقصى وقت مراقبة)
+    try { sock.presenceSubscribe?.(normalizeJid(resolvePhoneJid(memberJid))).catch(() => {}); } catch {}
+
+    // 2) رسالة الترحيب/الطُعم (إن كان هناك قروب استقبال) — تعمل كفخ إيصال
+    sendWelcomeBait(sock, memberJid).catch(() => {});
+
+    // 3) فحص الأجهزة: محاولتان داخل النافذة (0s و 25s) — نترك 10 ثوانٍ هامش قبل النهاية
+    const tries = [0, 25000];
+    for (const wait of tries) {
+        const elapsed = Date.now() - scan.startedAt;
+        if (elapsed < wait) await sleep(wait - elapsed);
+        if (scan.done) return;
+
+        scanCache.delete(key);
+        const res = await getLinkedDevices(sock, memberJid);
+        applyDeviceSignals(rec, res);
+        if (cfg().debug) console.log(`[botat] فحص ${numOf(key)} في ${group}: ok=${res.ok} linked=${res.count} maxId=${res.maxId}`);
+        if (res.ok) break; // نجاح — لا داعي للمحاولة الثانية
+    }
+
+    // 4) الحكم النهائي عند 60 ثانية بالضبط
+    const remaining = cfg().detectWindowMs - (Date.now() - scan.startedAt);
+    if (remaining > 0) await sleep(remaining);
+    if (scan.done) return;
+    scan.done = true;
+    activeScans.delete(key);
+
+    await evaluate(sock, rec, { final: true, group });
+    saveDb();
+}
+
+function cancelScan(memberJid) {
+    const key = normalizeJid(memberJid);
+    const scan = activeScans.get(key);
+    if (scan) { scan.done = true; activeScans.delete(key); }
 }
 
 // ============================================================
@@ -387,26 +574,22 @@ function reportText(rec, title = "تقرير فحص عضو") {
     ];
     if (rec.addedBy) lines.push(`➕ أضافه: ${numOf(rec.addedBy)}`);
     if (rec.devices) {
-        lines.push(rec.devices.ok
-            ? `📱 الأجهزة: ${rec.devices.list.length} (المرتبطة: ${rec.devices.count})`
-            : `📱 الأجهزة: تعذر الفحص - ${rec.devices.error}`);
-    }
-    lines.push(`✅ نفّذ المهمة: ${rec.taskDone ? "نعم" : "لا"}`);
-    const st = db.stats?.[numOf(rec.jid)];
-    if (st) {
-        lines.push(`📈 رسائله: من الجوال ${st.d0} | من جهاز مرتبط ${st.dx} | معرّف ويب ${st.w}/${st.w + st.o}`);
-    }
-    const sg = rec.signals;
-    if (sg.companionOnly || sg.quickRead || sg.autoReaction || /BAE5/.test(sg.idFingerprint?.reason || "")) {
-        lines.push("🤖 *التقدير:* مؤشرات سلوك آلي (بوت محتمل)");
-    } else if (sg.linkedDevices) {
-        lines.push("ℹ️ *التقدير:* جهاز مرتبط: بوت أو واتساب ويب (لا تفريق بينهما بدون سلوك)");
+        if (rec.devices.ok) {
+            lines.push(`📱 الأجهزة: [${rec.devices.list.join(", ")}] — المرتبطة: ${rec.devices.count}`);
+        } else {
+            lines.push(`📱 الأجهزة: ⚠️ تعذر الفحص — ${rec.devices.error}`);
+        }
     }
     const sig = Object.values(rec.signals);
     if (sig.length) {
         lines.push("", "*الإشارات:*", ...sig.map(s => `• ${s.reason} (+${s.points})`));
     } else {
         lines.push("", "لا توجد إشارات شك.");
+    }
+    if (rec.signals.deviceAged || (rec.signals.linkedDevices && rec.signals.nightOwl) || (rec.signals.linkedDevices && rec.signals.quickRead)) {
+        lines.push("🤖 *التقدير:* مؤشرات تتقاطع باتجاه بوت");
+    } else if (rec.signals.linkedDevices) {
+        lines.push("ℹ️ *التقدير:* جهاز مرتبط: واتساب ويب أو بوت — يُفترض الحذر ومراقبته");
     }
     return lines.join("\n");
 }
@@ -417,7 +600,7 @@ async function notifyOwners(sock, text, mentions = []) {
     }
 }
 
-async function evaluate(sock, rec, { final = false } = {}) {
+async function evaluate(sock, rec, { final = false, group = null } = {}) {
     const c = cfg();
     rec.level = classify(rec.score);
 
@@ -432,17 +615,9 @@ async function evaluate(sock, rec, { final = false } = {}) {
     if (!final) return;
 
     if (rec.level === "clear") {
-        if (c.requireTask && !rec.taskDone) {
-            rec.status = "waiting";
-            if (!rec.alerted) {
-                rec.alerted = true;
-                await notifyOwners(sock, reportText(rec, "لم ينفذ المهمة بعد (لا حكم)"));
-            }
-        } else {
-            rec.status = "clear";
-            if (c.autoAdmit && c.mainGroup && !rec.admitted) {
-                await admitToMain(sock, rec.jid).catch(() => {});
-            }
+        rec.status = "clear";
+        if (c.autoAdmit && c.mainGroup && !rec.admitted) {
+            await admitToMain(sock, rec.jid).catch(() => {});
         }
     } else {
         rec.status = "review";
@@ -455,19 +630,17 @@ async function evaluate(sock, rec, { final = false } = {}) {
 }
 
 // ============================================================
-// 🚨 الكشف داخل القروبات المفعّل فيها .كاشف on
-// أي عضو جديد يُفحص فوراً (حتى لو لم يرسل أي رسالة) عبر الأجهزة المرتبطة بالرقم
+// 🚨 إنذار داخل القروب المفعّل فيه .كاشف on
 // ============================================================
 
 const ALERT_COOLDOWN_MS = 10 * 60 * 1000;
-const groupQueues = new Map();   // group -> promise chain (لتسلسل الفحوص ومنع تزاحم الإنذارات)
+const groupQueues = new Map();
 
 function enqueue(group, fn) {
     const prev = groupQueues.get(group) || Promise.resolve();
     const next = prev.then(fn).catch(() => {});
     groupQueues.set(group, next);
     next.finally(() => { if (groupQueues.get(group) === next) groupQueues.delete(group); });
-    return next;
 }
 
 export function isDetectorOn(group) {
@@ -482,11 +655,9 @@ async function alertDetected(sock, group, memberJid, reason) {
     rec.status = "review";
     saveDb();
 
-    // 1) قفل الشات احتياطاً (يحتاج أن يكون البوت مشرفاً)
     let locked = false;
     try { await sock.groupSettingUpdate(group, "announcement"); locked = true; } catch {}
 
-    // 2) مشرفو القروب للمنشن
     let admins = [];
     try {
         const meta = await sock.groupMetadata(group);
@@ -505,13 +676,11 @@ async function alertDetected(sock, group, memberJid, reason) {
         `═════════════\n` +
         `📛_*تحذير هام*_⛔\n` +
         `═════════════\n` +
-        `تم الكشف عن بوت نشط لدى العضو: \n` +
+        `تم الكشف عن جهاز مرتبط / بوت لدى العضو: \n` +
         `${memberTag}\n` +
         `يرجى من ${adminTags}\n` +
         `التحقق بشأن هذا العضو وعدم ادخاله اي قروب والتعامل معه..${lockLine} \n` +
-        `تعاملو معه وتحققو معه..  تم إرسال \n` +
-        `طلب الى فريق ملوك المجال لوضع \n` +
-        `الرقم تحت الاستهداف في حال فعل شيء سيتم محاولة استهداف رقمه. \n` +
+        `تعاملو معه وتحققو معه..\n` +
         `*⌬━─⟐─ ⊱•┇☢️┇•⊰ ─⟐─━⌬*`;
 
     try {
@@ -520,31 +689,10 @@ async function alertDetected(sock, group, memberJid, reason) {
         console.error("botat: فشل إرسال تحذير الكشف:", e?.message);
     }
 
-    // 3) تقرير خاص للمالك
     await notifyOwners(sock,
-        reportText(rec, `🚨 كشف بوت: ${reason}`) + `\n📍 القروب: ${group}\n🔒 القفل: ${locked ? "تم" : "فشل (البوت غير مشرف؟)"}`
+        reportText(rec, `🚨 كشف: ${reason}`) + `\n📍 القروب: ${group}\n🔒 القفل: ${locked ? "تم" : "فشل (البوت غير مشرف؟)"}`
     ).catch(() => {});
     return true;
-}
-
-async function detectNewMember(sock, group, memberJid) {
-    if (isExemptIn(group, memberJid)) return;
-    const rec = getRecord(memberJid);
-
-    let res = await scanDevices(sock, rec);
-    if (!res.ok) {                       // أحياناً يفشل الاستعلام لحظة الدخول، نعيد مرة واحدة
-        scanCache.delete(rec.jid);
-        await sleep(4000);
-        res = await scanDevices(sock, rec);
-    }
-    rec.level = classify(rec.score);
-    saveDb();
-
-    if (cfg().debug) console.log(`[botat] كاشف ${numOf(memberJid)} في ${group}: ok=${res.ok} linked=${res.count} err=${res.error || "-"}`);
-
-    if (res.ok && res.count >= cfg().detectMinLinked) {
-        await alertDetected(sock, group, memberJid, `${res.count} جهاز مرتبط بالرقم عند الدخول`);
-    }
 }
 
 // ============================================================
@@ -565,7 +713,6 @@ export async function admitToMain(sock, memberJid) {
             saveDb();
             return { ok: true };
         }
-        // غالباً 403 = خصوصية تمنع الإضافة المباشرة -> رابط دعوة في الاستقبال
         const code = await sock.groupInviteCode(c.mainGroup);
         if (code && c.receptionGroup) {
             await sock.sendMessage(c.receptionGroup, {
@@ -586,146 +733,70 @@ export async function admitToMain(sock, memberJid) {
 // الأحداث الواردة من index.js
 // ============================================================
 
-// group-participants.update
 export async function onParticipantsUpdate(sock, update) {
     try {
         const c = cfg();
-        if (!c.enabled || update?.action !== "add") return;
+        if (!c.enabled) return;
+        const group = update?.id;
+        if (!group) return;
 
-        // سجل الدخول لكل القروبات (لتحليل الحوادث)
+        // مغادرة/طرد أثناء الفحص → إلغاء الفحص
+        if (update.action === "remove") {
+            for (const p of update.participants || []) cancelScan(toId(p));
+        }
+
+        if (update.action !== "add") return;
+
+        // سجل الدخول لكل القروبات
         for (const p of update.participants || []) {
-            db.joinLog.push({ group: update.id, member: normalizeJid(toId(p)), by: update.author ? normalizeJid(update.author) : null, at: Date.now() });
+            db.joinLog.push({ group, member: normalizeJid(toId(p)), by: update.author ? normalizeJid(update.author) : null, at: Date.now() });
         }
         if (db.joinLog.length > 1000) db.joinLog = db.joinLog.slice(-1000);
         saveDb();
 
-        // 🚨 كاشف القروب (.كاشف on): فحص كل عضو جديد فوراً
-        if (isDetectorOn(update.id)) {
-            for (const p of update.participants || []) {
-                const id = toId(p);
-                if (!id) continue;
-                enqueue(update.id, () => detectNewMember(sock, update.id, normalizeJid(id)));
-            }
-        }
-
-        if (!c.receptionGroup || update.id !== c.receptionGroup) return;
+        const isReception = !!c.receptionGroup && group === c.receptionGroup;
+        if (!isReception && !isDetectorOn(group)) return;
 
         for (const p of update.participants || []) {
-            const memberJid = normalizeJid(toId(p));
-            if (isExempt(memberJid)) continue;
-
-            const rec = getRecord(memberJid);
-            rec.joinedAt = Date.now();
-            rec.addedBy = update.author ? normalizeJid(update.author) : null;
-            rec.status = "pending";
-            rec.alerted = false;
-
-            await scanDevices(sock, rec);
-            await sendWelcomeBait(sock, memberJid);
-            await evaluate(sock, rec, { final: false });
-            scheduleFinalize(sock, memberJid);
-            saveDb();
+            const id = toId(p);
+            if (!id) continue;
+            const memberJid = normalizeJid(id);
+            if (isExemptIn(group, memberJid)) continue;
+            enqueue(group, () => runJoinScan(sock, group, memberJid, update.author));
         }
     } catch (e) {
         console.error("botat onParticipantsUpdate:", e?.message);
     }
 }
 
-function scheduleFinalize(sock, memberJid) {
-    const key = normalizeJid(memberJid);
-    if (finalizeTimers.has(key)) clearTimeout(finalizeTimers.get(key));
-    const t = setTimeout(async () => {
-        finalizeTimers.delete(key);
-        const rec = getRecord(key, false);
-        if (rec) await evaluate(sock, rec, { final: true }).catch(() => {});
-    }, cfg().finalizeAfterMs);
-    t.unref?.();
-    finalizeTimers.set(key, t);
-}
-
-// messages.upsert (رسائل القروبات)
+// رسائل: الغرض الوحيد هنا بناء خريطة LID→رقم (إن أرسل العضو لاحقاً)
+// + احتساب إشارات لمن كان تحت الفحص وبدأ يتكلم أثناء النافذة
 export async function onMessage(sock, msg) {
     try {
-        const c = cfg();
-        if (!c.enabled) return;
-        const group = msg?.key?.remoteJid;
-        if (!group || !group.endsWith("@g.us") || msg.key.fromMe) return;
+        const pn = msg?.key?.participantPn || msg?.key?.remoteJidPn;
+        if (pn) rememberLidMapping(msg.key.participant || msg.key.remoteJid, pn);
 
-        const participant = msg.key.participant;
-        if (!participant || isExempt(participant)) return;
-
-        // 1) إحصاءات السلوك في كل القروبات
-        const ka = analyzeKey(msg.key);
-        const num = numOf(participant);
-        const st = observeSender(num, ka);
-        saveDbSoon();
-
-        const inReception = !!c.receptionGroup && group === c.receptionGroup;
-
-        // 2) خارج الاستقبال: لا نتحرك إلا لو ثبت سلوك بوت (كل رسائله من جهاز مرتبط)
-        if (!inReception) {
-            if (!isCompanionOnly(st)) return;
-            const rec = getRecord(participant);
-            if (msg.pushName) rec.name = msg.pushName;
-            if (rec.signals.companionOnly) return;
-            setSignal(rec, "companionOnly", c.points.companionOnly,
-                `${st.dx + st.w > 0 ? "كل رسائله" : ""} من جهاز مرتبط/عميل ويب (${Math.max(st.dx, st.w)} رسالة بدون أي رسالة من الجوال)`);
-            if (!rec.devices) await scanDevices(sock, rec);
-            rec.level = classify(rec.score);
-            if (isDetectorOn(group) && !isExemptIn(group, participant)) {
-                await alertDetected(sock, group, participant, "كل رسائله من جهاز مرتبط/عميل ويب (سلوك بوت)");
+        const sender = msg?.key?.participant;
+        if (!sender) return;
+        const key = normalizeJid(sender);
+        const scan = activeScans.get(key);
+        if (scan && !scan.done) {
+            // بدأ يتكلم أثناء الدقيقة — لا ننتظر، نحسم فوراً بتقرير مبكر
+            scan.done = true;
+            activeScans.delete(key);
+            const rec = getRecord(sender, false);
+            if (rec) {
+                await evaluate(sock, rec, { final: true, group: msg.key.remoteJid });
+                saveDb();
             }
-            if (!rec.alerted) {
-                rec.alerted = true;
-                rec.status = "review";
-                await notifyOwners(sock, reportText(rec, "🤖 سلوك بوت محتمل (رُصد خارج الاستقبال)") + `\n📍 القروب: ${group}`);
-            }
-            saveDb();
-            return;
         }
-
-        // 3) داخل الاستقبال: التحليل الكامل
-        const rec = getRecord(participant);
-        if (msg.pushName) rec.name = msg.pushName;
-
-        // عضو قديم لم يُفحص بعد
-        if (!rec.devices) {
-            await scanDevices(sock, rec);
-            scheduleFinalize(sock, participant);
-        }
-
-        if (c.debug) {
-            console.log(`[botat] رسالة ${num} | id=${ka.id} (${ka.id.length}) | device=${ka.device}`);
-        }
-        for (const f of ka.found) setSignal(rec, f.key, f.points, f.reason);
-        if (isCompanionOnly(st)) {
-            setSignal(rec, "companionOnly", c.points.companionOnly,
-                `كل رسائله من جهاز مرتبط/عميل ويب (${Math.max(st.dx, st.w)} رسالة)`);
-        }
-
-        const isReaction = !!msg.message?.reactionMessage;
-        const sinceBait = rec.baitSentAt ? Date.now() - rec.baitSentAt : Infinity;
-
-        if (isReaction && sinceBait <= c.quickReplyMs) {
-            setSignal(rec, "autoReaction", c.points.autoReaction, `تفاعل تلقائي بعد ${sinceBait}ms من الترحيب`);
-        }
-
-        // أي رسالة نصية = تنفيذ المهمة
-        const hasText = !!(msg.message?.conversation || msg.message?.extendedTextMessage?.text);
-        if (hasText && !rec.taskDone) {
-            rec.taskDone = true;
-            rec.taskAt = Date.now();
-        }
-
-        await evaluate(sock, rec, { final: false });
-        saveDb();
     } catch (e) {
         console.error("botat onMessage:", e?.message);
     }
 }
 
 // ============================================================
-// الأوامر (تعمل بالنقطة فقط لتفادي التفعيل بالغلط)
+// الأوامر
 // ============================================================
 
 function getText(msg) {
@@ -745,10 +816,9 @@ function pickTarget(ctx) {
 
 const BOTAT_COMMANDS = new Set([
     "كاشف", "تعيين_استقبال", "تعيين_اساسي", "قبول_تلقائي",
-    "فحص", "قبول", "المشتبهين", "سجل_الدخول", "تشخيص_كاشف", "حالة_الكاشف", "بصمة"
+    "فحص", "قبول", "المشتبهين", "سجل_الدخول", "تشخيص_كاشف", "حالة_الكاشف"
 ]);
 
-// يرجع true إذا عالج الأمر
 export async function handleBotatCommand(ctx) {
     const { sock, jid, msg, command, args, isOwner, hasLocalAccess, isGroup } = ctx;
     if (!BOTAT_COMMANDS.has(command)) return false;
@@ -762,13 +832,11 @@ export async function handleBotatCommand(ctx) {
         const v = onOff(args[0]?.toLowerCase());
         if (v === null) return reply("الاستخدام: `.كاشف on` أو `.كاشف off`"), true;
 
-        // خارج القروبات (خاص): مفتاح عام للكاشف كله
         if (!isGroup) {
             db.config.enabled = v; saveDb();
             return reply(v ? "✅ تم تشغيل كاشف البوتات (عام)" : "❌ تم إيقاف كاشف البوتات (عام)"), true;
         }
 
-        // داخل قروب: تفعيل/إيقاف الكشف لهذا القروب فقط
         if (v) {
             db.config.enabled = true;
             db.detectGroups[jid] = true;
@@ -787,7 +855,7 @@ export async function handleBotatCommand(ctx) {
         } catch {}
         return reply(
             "✅ تم تشغيل كاشف البوتات في هذا القروب\n" +
-            "🕵️ أي عضو جديد يدخل سيُفحص فوراً (أجهزته المرتبطة) حتى لو لم يرسل رسالة." + adminNote
+            "⏱ كل عضو جديد سيُفحص خلال 60 ثانية من دخوله (حتى لو لم يرسل رسالة)." + adminNote
         ), true;
     }
 
@@ -795,14 +863,14 @@ export async function handleBotatCommand(ctx) {
         const v = onOff(args[0]?.toLowerCase());
         if (v === null) return reply("الاستخدام: `.تشخيص_كاشف on/off`"), true;
         db.config.debug = v; saveDb();
-        return reply(v ? "🧪 وضع التشخيص شغّال (البصمات تظهر في سجل السيرفر)" : "وضع التشخيص مطفأ"), true;
+        return reply(v ? "🧪 وضع التشخيص شغّال" : "وضع التشخيص مطفأ"), true;
     }
 
     if (command === "قبول_تلقائي") {
         const v = onOff(args[0]?.toLowerCase());
         if (v === null) return reply("الاستخدام: `.قبول_تلقائي on/off`"), true;
         db.config.autoAdmit = v; saveDb();
-        return reply(v ? "✅ القبول التلقائي للحالات النظيفة شغّال" : "❌ القبول التلقائي مطفأ (القبول يدوي)"), true;
+        return reply(v ? "✅ القبول التلقائي للحالات النظيفة شغّال" : "❌ القبول التلقائي مطفأ"), true;
     }
 
     if (command === "تعيين_استقبال" || command === "تعيين_اساسي") {
@@ -818,6 +886,7 @@ export async function handleBotatCommand(ctx) {
         const c = cfg();
         const total = Object.keys(db.members).length;
         const sus = Object.values(db.members).filter(m => classify(m.score) !== "clear").length;
+        const scanning = activeScans.size;
         return reply(
             `🕵️ *حالة الكاشف*\n` +
             `التشغيل العام: ${c.enabled ? "✅" : "❌"}\n` +
@@ -825,8 +894,10 @@ export async function handleBotatCommand(ctx) {
             `الاستقبال: ${c.receptionGroup ? "معيّن" : "غير معيّن"}\n` +
             `الأساسي: ${c.mainGroup ? "معيّن" : "غير معيّن"}\n` +
             `قبول تلقائي: ${c.autoAdmit ? "نعم" : "لا"}\n` +
-            `تشخيص: ${c.debug ? "نعم" : "لا"}\n` +
-            `أعضاء مفحوصون: ${total} | مشتبه بهم: ${sus}`
+            `نافذة الفحص: ${c.detectWindowMs / 1000} ثانية\n` +
+            `فحوصات جارية الآن: ${scanning}\n` +
+            `أعضاء مفحوصون: ${total} | مشتبه بهم: ${sus}\n` +
+            `خريطة LID محلولة: ${Object.keys(db.lidMap || {}).length}`
         ), true;
     }
 
@@ -835,37 +906,11 @@ export async function handleBotatCommand(ctx) {
         if (!target) return reply("الاستخدام: `.فحص @عضو` أو رد على رسالته أو اكتب رقمه"), true;
         const rec = getRecord(target);
         scanCache.delete(rec.jid);
-        await scanDevices(sock, rec);
+        const res = await getLinkedDevices(sock, rec.jid);
+        applyDeviceSignals(rec, res);
         rec.level = classify(rec.score);
         saveDb();
         return reply(reportText(rec)), true;
-    }
-
-    if (command === "بصمة") {
-        const target = pickTarget(ctx);
-        if (!target) return reply("الاستخدام: `.بصمة @عضو` أو رد على رسالته أو اكتب رقمه"), true;
-        const num = numOf(target);
-        const st = db.stats?.[num];
-        const rec = getRecord(target, false);
-        const lines = [`🔬 *بصمة ${num}*`];
-        if (st) {
-            lines.push(
-                `رسائل من الجوال (device 0): ${st.d0}`,
-                `رسائل من جهاز مرتبط: ${st.dx}`,
-                `معرّفات 3EB0 (ويب/مكتبة): ${st.w} | غيرها: ${st.o}`,
-                `آخر المعرّفات:\n${st.ids.map(i => `• ${i} (${i.length})`).join("\n") || "-"}`
-            );
-        } else {
-            lines.push("لا توجد رسائل مرصودة منه بعد (يُرصد فقط ما يرسله بعد تشغيل هذا الإصدار).");
-        }
-        if (rec?.devices) {
-            lines.push(rec.devices.ok
-                ? `الأجهزة: [${rec.devices.list.join(", ")}] عبر ${rec.devices.method}`
-                : `فحص الأجهزة فشل: ${rec.devices.error}`);
-        } else {
-            lines.push("لم يُفحص الأجهزة بعد (استخدم `.فحص`).");
-        }
-        return reply(lines.join("\n")), true;
     }
 
     if (command === "قبول") {
@@ -907,5 +952,6 @@ export function cleanupBotat() {
         const now = Date.now();
         for (const [id, b] of baits) if (now - b.sentAt > 60 * 60 * 1000) baits.delete(id);
         for (const [k, v] of scanCache) if (now - v.at > SCAN_CACHE_MS) scanCache.delete(k);
+        for (const [k, s] of activeScans) if (now - s.startedAt > cfg().detectWindowMs + 30000) activeScans.delete(k);
     } catch {}
 }
