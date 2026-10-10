@@ -13,7 +13,6 @@ if (typeof globalThis.crypto === "undefined") {
     globalThis.crypto = webcrypto;
 }
 
-// __dirname for ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -78,20 +77,18 @@ import {
     flushBotat
 } from "./botat.js";
 
-// Load settings.json (ESM way)
+// Load settings.json
 const settingsPath = path.join(__dirname, "settings.json");
 let settings = {};
 try {
     settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
 } catch (e) {
-    console.error("⚠️ تعذر قراءة settings.json، سيتم الاعتماد على متغيرات البيئة:", e?.message);
+    console.error("⚠️ تعذر قراءة settings.json:", e?.message);
 }
 
-// متغيرات البيئة تتفوق على الملف (مفيدة في Railway حتى لا تُرفع الأرقام على GitHub)
 if (process.env.OWNERS) settings.owners = process.env.OWNERS.split(",").map(x => x.trim()).filter(Boolean);
 if (process.env.BOT_NUMBER) settings.botNumber = process.env.BOT_NUMBER;
 
-// مجلد البيانات الدائم: على Railway اربط Volume على /data وضع DATA_DIR=/data
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
 
@@ -159,10 +156,10 @@ let db = {
     reportGroup: null,
     blacklistGroups: [],
     exceptions: {},
-    backupGroups: {},      // { groupJid: true } - قروبات النسخ الاحتياطي .حفظ on
-    lastBackupAt: {},      // { groupJid: timestamp } - آخر إرسال للنسخة
-    protectedMembers: {},  // { groupJid: { memberJid: { addedBy, addedAt } } } - حماية .احميه (دائمة)
-    pendingUnlocks: {}     // { groupJid: timestamp } - فتح القروب بعد القفل الاحترازي (يصمد أمام إعادة التشغيل)
+    backupGroups: {},
+    lastBackupAt: {},
+    protectedMembers: {},
+    pendingUnlocks: {}
 };
 
 if (fs.existsSync(dbFile)) {
@@ -175,16 +172,14 @@ if (fs.existsSync(dbFile)) {
                     db = { ...db, ...parsed };
                 }
             } catch (e) {
-                // لا نكتب فوق ملف تالف: نحفظ نسخة منه أولاً
                 try { fs.copyFileSync(dbFile, `${dbFile}.corrupt-${Date.now()}`); } catch {}
-                _originalError("⚠️ database.json تالف، حُفظت نسخة منه وسيتم إنشاء ملف جديد.");
+                _originalError("⚠️ database.json تالف، حُفظت نسخة منه.");
             }
         }
     } catch (e) {
         _originalError("⚠️ لم يتمكن البوت من قراءة database.json:", e?.message);
     }
 }
-// ضمان وجود كل الحقول بالنوع الصحيح (ملف قديم/مستعاد قد ينقصه بعضها)
 for (const k of ["authorizedUsers", "globalAuthorized", "groupSettings", "exceptions", "backupGroups", "lastBackupAt", "protectedMembers", "pendingUnlocks"]) {
     if (!db[k] || typeof db[k] !== "object" || Array.isArray(db[k])) db[k] = {};
 }
@@ -209,6 +204,8 @@ let reconnectTimer = null;
 let isReconnecting = false;
 let shuttingDown = false;
 let reconnectAttempts = 0;
+let pairingCodeRequested = false;
+let pairingRetryTimer = null;
 
 const kickTracker = {};
 const KICK_TRACKER_TTL_MS = 10 * 60 * 1000;
@@ -264,7 +261,6 @@ function cleanNumber(v) {
     return String(v).replace(/[^0-9]/g, "");
 }
 
-// المنشن قد يأتي من نص عادي أو من تعليق صورة/فيديو/مستند
 function getMentionedJids(m) {
     if (!m) return [];
     const ctx =
@@ -363,12 +359,11 @@ function stopWatchdog() {
 }
 
 // ============================================================
-// ⚡ أدوات السرعة: فك الأغلفة + كاش القروبات + كشف جهات الاتصال
+// ⚡ أدوات السرعة
 // ============================================================
 
 const DEBUG_INCOMING = !!process.env.BOT_DEBUG;
 
-// فك أغلفة الرسائل (اختفاء الرسائل، عرض لمرة واحدة، إلخ) حتى لا تضيع النصوص والأوامر
 const WRAPPERS = [
     "ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2",
     "viewOnceMessageV2Extension", "documentWithCaptionMessage", "deviceSentMessage"
@@ -396,7 +391,6 @@ function messageAgeSec(msg) {
     return t ? Math.max(0, Date.now() / 1000 - t) : 0;
 }
 
-// معرّفات الرسائل التي أرسلها البوت نفسه (لتجنب معالجتها كأوامر عند قبول رسائل رقمه)
 const botSentIds = new Set();
 function rememberBotSent(id) {
     botSentIds.add(id);
@@ -406,7 +400,6 @@ function genMessageId() {
     return "3EB0" + randomBytes(18).toString("hex").toUpperCase();
 }
 
-// كاش بيانات القروبات: يحذف عن Baileys جلب groupMetadata عند كل إرسال (أكبر سبب للبطء)
 const groupMetaCache = new Map();
 const GROUP_META_TTL_MS = 10 * 60 * 1000;
 
@@ -476,7 +469,7 @@ function ensureGroupSettings(jid) {
 }
 
 // ============================================================
-// 🔓 فتح القروب بعد القفل الاحترازي (محفوظ في database.json)
+// 🔓 فتح القروب بعد القفل
 // ============================================================
 
 const unlockFails = {};
@@ -517,7 +510,7 @@ async function runUnlockCheck() {
 }
 
 // ============================================================
-// 🛡️ .احميه : حماية إشراف عضو من السحب (دائمة ومحفوظة في database.json)
+// 🛡️ حماية الإشراف
 // ============================================================
 
 function userKey(jid) {
@@ -543,7 +536,6 @@ function removeProtectedEntry(groupJid, memberJid) {
     return true;
 }
 
-// يُستدعى عند أي demote في القروب
 async function handleProtectedDemote(sock, update) {
     const jid = update.id;
     const author = update.author;
@@ -552,7 +544,6 @@ async function handleProtectedDemote(sock, update) {
     const authorNum = userKey(author);
     if (authorNum === getBotNumber(sock) || getOwnerNumbers().includes(authorNum)) return;
 
-    // المحميّون الذين سُحب إشرافهم (غير المنفّذ نفسه)
     const victims = [];
     for (const p of update.participants || []) {
         const pid = typeof p === "string" ? p : p?.id;
@@ -561,7 +552,6 @@ async function handleProtectedDemote(sock, update) {
     }
     if (!victims.length) return;
 
-    // 1) إرجاع الإشراف للمحمي + 2) سحب إشراف المعتدي (بالتوازي لأقصى سرعة)
     const [restoreRes, punishRes] = await Promise.allSettled([
         sock.groupParticipantsUpdate(jid, victims, "promote"),
         sock.groupParticipantsUpdate(jid, [author], "demote")
@@ -569,7 +559,6 @@ async function handleProtectedDemote(sock, update) {
     const punished = punishRes.status === "fulfilled" && String(punishRes.value?.[0]?.status || "200") === "200";
     const restored = restoreRes.status === "fulfilled";
 
-    // 3) منشن للمشرفين
     let admins = [];
     const meta = (await sock.groupMetadata(jid).catch(() => null)) || getCachedMeta(jid);
     if (meta?.participants) {
@@ -602,14 +591,14 @@ async function handleProtectedDemote(sock, update) {
 }
 
 // ============================================================
-// 💾 .حفظ on/off : إرسال database.json كملف إلى القروب كل 24 ساعة
+// 💾 النسخ الاحتياطي
 // ============================================================
 
 const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 async function sendBackup(sock, groupJid, reason = "تلقائي") {
     try {
-        saveDb(); // تأكد أن الملف محدّث قبل الإرسال
+        saveDb();
         const buf = fs.readFileSync(dbFile);
         const stamp = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "-");
         await sock.sendMessage(groupJid, {
@@ -648,7 +637,6 @@ const contactHooks = {
     getGroupName: async (jid) => (await getGroupMetaFast(currentSock, jid))?.subject
 };
 
-// المسار السريع: متزامن بالكامل حتى لحظة إطلاق الطرد/الحذف. يرجع true إذا استهلك الرسالة.
 function fastContactGuard(sock, msg) {
     const jid = msg?.key?.remoteJid;
     if (!jid || !jid.endsWith("@g.us") || msg.key.fromMe) return false;
@@ -656,7 +644,6 @@ function fastContactGuard(sock, msg) {
     if (!sender) return false;
     if (!db.groupSettings[jid]?.protection) return false;
 
-    // فيضان من شخص تم طرده للتو: حذف فوري لأي رسالة منه
     if (isPunished(jid, sender)) {
         handlePunishedFollowUp(sock, jid, sender, msg);
         return true;
@@ -669,12 +656,10 @@ function fastContactGuard(sock, msg) {
     return true;
 }
 
-// هل تُعالَج هذه الرسالة كرسالة عادية؟ (يشمل رسائل رقم البوت نفسه)
 function shouldProcess(msg, type) {
     if (!msg?.message) return false;
     if (msg.key?.id && botSentIds.has(msg.key.id)) return false;
     if (type === "notify") return true;
-    // رسائل رقم البوت المرسلة من التلفون قد تصل كـ append
     if (type === "append" && msg.key?.fromMe && messageAgeSec(msg) <= 30) return true;
     return false;
 }
@@ -694,11 +679,54 @@ function cleanupSocket(sock) {
 }
 
 // ============================================================
-// إنشاء Socket
+// 🔑 إدارة الجلسة والاقتران (معدّل - الإصلاح الجذري)
 // ============================================================
 
 function getSessionDir() {
     return path.join(DATA_DIR, settings.sessionName || settings.sessionFolder || "session");
+}
+
+// 🔥 دالة حذف الجلسة عند تلفها
+function wipeSession() {
+    const dir = getSessionDir();
+    try {
+        if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true });
+            _originalWarn(`🗑️ تم حذف مجلد الجلسة: ${dir}`);
+        }
+    } catch (e) {
+        _originalError("فشل حذف الجلسة:", e?.message);
+    }
+}
+
+// 🔥 دالة طلب رمز الاقتران مع منع التكرار
+async function requestPairingCodeSafe(sock, phoneNumber) {
+    if (pairingCodeRequested) return;
+    pairingCodeRequested = true;
+
+    const cleanPhone = cleanNumber(phoneNumber);
+    if (!cleanPhone || cleanPhone.length < 8) {
+        _originalError("❌ رقم الاقتران غير صحيح! تحقق من settings.json → botNumber");
+        _originalError("📌 يجب أن يكون الرقم بصيغة دولية بدون + مثل: 966512345678");
+        pairingCodeRequested = false;
+        return;
+    }
+
+    try {
+        _originalLog(`📱 طلب رمز اقتران للرقم: ${cleanPhone}`);
+        let code = await sock.requestPairingCode(cleanPhone);
+        code = code?.match(/.{1,4}/g)?.join("-") || code;
+
+        _originalLog("\n╔════════════════════════════════════╗");
+        _originalLog(`║  🔑 رمز الاقتران: [ ${code} ]  ║`);
+        _originalLog("╚════════════════════════════════════╝");
+        _originalLog("📌 افتح واتساب → الأجهزة المرتبطة → ربط جهاز → ربط برقم الهاتف");
+        _originalLog("⏳ الرمز صالح لمدة 60 ثانية فقط\n");
+
+    } catch (e) {
+        _originalError("❌ فشل طلب رمز الاقتران:", e?.message);
+        pairingCodeRequested = false;
+    }
 }
 
 function scheduleReconnect(delayMs) {
@@ -750,7 +778,6 @@ async function startBot() {
         const sock = makeWASocket(sockOptions);
         currentSock = sock;
 
-        // نسجل معرّف كل رسالة يرسلها البوت قبل إرسالها (حتى لا يعالج البوت رسائله كأوامر)
         const rawSend = sock.sendMessage.bind(sock);
         sock.sendMessage = (to, content, options = {}) => {
             const id = options?.messageId || genMessageId();
@@ -759,22 +786,14 @@ async function startBot() {
         };
 
         const owners = getOwnerNumbers();
-        // رمز الاقتران يخص رقم البوت (وليس بالضرورة المالك): botNumber أولاً ثم أول مالك
         const pairingNumber = cleanNumber(settings.botNumber || "") || owners[0] || "";
 
+        // 🔥 طلب الرمز فقط إذا لم يكن مسجلاً
         if (!sock.authState.creds.registered && pairingNumber) {
-            setTimeout(async () => {
-                try {
-                    if (currentSock !== sock) return;
-                    let code = await sock.requestPairingCode(pairingNumber);
-                    code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    _originalLog(`\n========================================`);
-                    _originalLog(`🔑 رمز الاقتران: [ ${code} ]`);
-                    _originalLog(`========================================\n`);
-                } catch (e) {
-                    _originalError("❌ خطأ في رمز الاقتران:", e?.message);
-                }
-            }, 4000);
+            pairingCodeRequested = false;
+            setTimeout(() => requestPairingCodeSafe(sock, pairingNumber), 4000);
+        } else if (sock.authState.creds.registered) {
+            _originalLog("✅ الجلسة موجودة، جاري الاتصال...");
         }
 
         sock.ev.on("creds.update", saveCreds);
@@ -788,6 +807,7 @@ async function startBot() {
             if (connection === "open") {
                 isReconnecting = false;
                 reconnectAttempts = 0;
+                pairingCodeRequested = false;
                 lastActivityAt = Date.now();
                 startWatchdog();
                 initBotat({ owners: getOwnerNumbers(), botNumber: getBotNumber(sock), isTrusted: isTrustedSender });
@@ -803,19 +823,22 @@ async function startBot() {
 
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const loggedOut = statusCode === DisconnectReason.loggedOut;
+                const badSession = statusCode === 401 || statusCode === 500;
 
-                if (loggedOut) {
-                    _originalError("🚫 تم تسجيل خروج الجلسة. سيتم حذف الجلسة القديمة وطلب رمز اقتران جديد.");
+                if (loggedOut || badSession) {
+                    _originalError(`🚫 فشل الجلسة (${statusCode}). جاري حذف الجلسة التالفة وطلب رمز جديد...`);
                     cleanupSocket(sock);
                     currentSock = null;
-                    try { fs.rmSync(getSessionDir(), { recursive: true, force: true }); } catch {}
-                    scheduleReconnect(5000);
+                    wipeSession();
+                    pairingCodeRequested = false;
+                    reconnectAttempts = 0;
+                    scheduleReconnect(3000);
                     return;
                 }
 
                 reconnectAttempts++;
                 const delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttempts, 5)), 30000);
-                _originalWarn(`⚠️ انقطع الاتصال. إعادة المحاولة بعد ${Math.ceil(delay / 1000)}ث`);
+                _originalWarn(`⚠️ انقطع الاتصال (${statusCode}). إعادة المحاولة بعد ${Math.ceil(delay / 1000)}ث`);
 
                 scheduleReconnect(delay);
             }
@@ -835,18 +858,15 @@ async function startBot() {
 
                 const settingsJid = ensureGroupSettings(jid);
 
-                // 🕵️ كاشف البوتات (فحص الأعضاء الجدد في الاستقبال + سجل الدخول)
                 if (update.action === "add") {
                     botatOnParticipants(sock, update).catch(() => {});
                 }
 
-                // 🛡️ .احميه : أي محاولة سحب إشراف عضو محمي
                 if (update.action === "demote") {
                     await handleProtectedDemote(sock, update).catch(e =>
                         _originalError("Protected demote error:", e?.message));
                 }
 
-                // لا نعتبر طرد البوت نفسه (حماية الاتصال/المخالفات) مغادرة
                 if (settingsJid.leave && update.action === "remove" &&
                     userKey(update.author) !== getBotNumber(sock)) {
                     await handleAntiLeaveZzs(sock, update, { scheduleUnlock }).catch(() => {});
@@ -860,7 +880,6 @@ async function startBot() {
                     const authorNum = userKey(author);
                     const isOwnerAuthor = getOwnerNumbers().includes(authorNum) || authorNum === getBotNumber(sock);
 
-                    // 🛡️ حماية الإشراف المؤقت
                     if (isProtectedAdmin(jid, author) && !isOwnerAuthor) {
                         try {
                             await sock.groupParticipantsUpdate(jid, [target], "add").catch(() => {});
@@ -890,14 +909,12 @@ async function startBot() {
                             }).catch(() => {});
 
                             scheduleUnlock(jid, 3 * 60 * 1000);
-
                             return;
                         } catch (e) {
                             _originalError("Protected admin action error:", e?.message);
                         }
                     }
 
-                    // ⚔️ حماية الزرف
                     if (settingsJid.antiZarf && !isOwnerAuthor && !isTrustedSender(jid, author)) {
                         const now = Date.now();
                         if (!kickTracker[jid]) kickTracker[jid] = {};
@@ -936,16 +953,10 @@ async function startBot() {
             }
         });
 
-        // ========================================================
-        // 🕵️ إيصالات القراءة (فخ كاشف البوتات)
-        // ========================================================
         sock.ev.on("message-receipt.update", (updates) => {
             botatOnReceipt(sock, updates).catch(() => {});
         });
 
-        // ========================================================
-        // Messages
-        // ========================================================
         sock.ev.on("presence.update", (update) => {
             botatOnPresence(sock, update).catch(() => {});
         });
@@ -960,7 +971,6 @@ async function startBot() {
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (!Array.isArray(messages) || !messages.length) return;
 
-            // 1) المرحلة السريعة (متزامنة): فك الأغلفة + ضرب جهات الاتصال فوراً لكل الرسائل في الدفعة
             const rest = [];
             for (const m of messages) {
                 try {
@@ -977,7 +987,6 @@ async function startBot() {
                 rest.push(m);
             }
 
-            // 2) المعالجة العادية لكل رسالة (بالتوازي، وليس أول رسالة فقط)
             const work = [];
             for (const msg of rest) {
                 if (!shouldProcess(msg, type)) continue;
@@ -1015,7 +1024,6 @@ async function handleIncomingMessage(sock, msg) {
     const mText = getMessageText(msg);
     const mContent = msg.message;
 
-    // لا ننشئ سجلاً دائماً للمحادثات الخاصة (أي شخص يراسل البوت كان يضخّم قاعدة البيانات)
     const settingsJid = isGroup ? ensureGroupSettings(jid) : DEFAULT_SETTINGS_JID();
 
     const senderNum = cleanNumber(sender.split("@")[0]);
@@ -1031,12 +1039,10 @@ async function handleIncomingMessage(sock, msg) {
         trackMessage(jid, sender, msg.key);
     }
 
-    // 🕵️ كاشف البوتات (تحليل رسائل الاستقبال)
     if (isGroup && !msg.key.fromMe) {
         botatOnMessage(sock, msg).catch(() => {});
     }
 
-    // antiMention
     if (isGroup && settingsJid.antiMention && !isOwner && !msg.key.fromMe) {
         const mentionedJids = getMentionedJids(msg.message);
 
@@ -1055,9 +1061,6 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // حماية جهات الاتصال: تُعالج الآن في المسار السريع (fastContactGuard) قبل الوصول هنا
-
-    // المراقبة
     const isExceptional = db.exceptions?.[jid]?.[sender];
     if (isGroup && settingsJid.monitoring && !isOwner && !isExceptional && !msg.key.fromMe) {
         const violationReason = checkSpamAndViolations(
@@ -1095,7 +1098,6 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // إيموجي عشوائي
     if (settingsJid.emoji && settingsJid.filters.emoji && isGroup && mText && !msg.key.fromMe) {
         if (!global.emojiCounters) global.emojiCounters = {};
         if (!global.emojiCounters[jid]) global.emojiCounters[jid] = 0;
@@ -1109,12 +1111,10 @@ async function handleIncomingMessage(sock, msg) {
         }
     }
 
-    // الأوامر
     let command = "";
     let args = [];
     const mentioned = getMentionedJids(msg.message);
 
-    // الأوامر لا تعمل إلا ببادئة "." (كانت الكلمات العادية مثل "قفل" و"فتح" و"معلومات" تُنفَّذ كأوامر)
     const trimmedText = mText.trim();
     if (!trimmedText.startsWith(".")) return;
     {
@@ -1150,10 +1150,9 @@ async function handleCommands(ctx) {
         deleteCommandMessage, sender, senderNum, isGroup
     } = ctx;
 
-    // 🕵️ أوامر كاشف البوتات
     if (await handleBotatCommand({ ...ctx })) return;
 
-    // 💾 .حفظ on/off : النسخ الاحتياطي لقاعدة البيانات إلى هذا القروب (للمالك فقط)
+    // .حفظ on/off
     if (command === "حفظ" && getMessageText(msg).trim().startsWith(".")) {
         await deleteCommandMessage();
         if (!isGroup) return;
@@ -1188,7 +1187,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 📋 .قائمة on/off : تعيين هذا الجروب لاستقبال استمارات المؤبدين
+    // .قائمة on/off
     if ((command === "قائمة" || command === "القائمة") && getMessageText(msg).trim().startsWith(".")) {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1222,7 +1221,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 🚫 .سحب صلاحيات @عضو : سحب كل صلاحياته من البوت في كل القروبات
+    // .سحب صلاحيات
     if (
         (command === "سحب" && (args[0] === "صلاحيات" || args[0] === "الصلاحيات")) ||
         command === "سحب_صلاحيات"
@@ -1267,7 +1266,6 @@ async function handleCommands(ctx) {
                 if (sameUser(k)) { delete db.authorizedUsers[g][k]; removed++; }
             }
         }
-        // سحب الإشراف المحمي (.اشرافه) من كل القروبات
         for (const g of Object.keys(db.groupSettings || {})) {
             try { if (removeProtectedAdmin(g, target)) removed++; } catch {}
         }
@@ -1285,8 +1283,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-
-    // 1. قائمة الأوامر
+    // قائمة الأوامر
     if (command === "اوامر" || command === "أوامر") {
         await deleteCommandMessage();
         if (!hasLocalAccess && !isOwner) {
@@ -1324,7 +1321,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 2. أوامر التبديل
+    // أوامر التبديل
     const toggleCommands = {
         "منع_المنشن": { key: "antiMention", on: "antiMention" },
         "منع_منشن": { key: "antiMention", on: "antiMention" },
@@ -1372,7 +1369,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 3. فورمات
+    // فورمات
     if (command === "فورمات") {
         await deleteCommandMessage();
         if (!isOwner) {
@@ -1392,7 +1389,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 4. إعطاء
+    // إعطاء
     if (command === "إعطاء" || command === "اعطاء") {
         await deleteCommandMessage();
         if (!isOwner) {
@@ -1418,7 +1415,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 5. منع
+    // منع
     if (command === "منع") {
         await deleteCommandMessage();
         if (!isOwner) return;
@@ -1441,7 +1438,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 6. بلاغات 879
+    // بلاغات 879
     if (command === "879") {
         if (!isOwner && !hasLocalAccess) return;
         if (isGroup) {
@@ -1461,7 +1458,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 7. الدعم
+    // الدعم
     if (command === "الدعم") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1488,7 +1485,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 8. اشرافه
+    // اشرافه
     if (command === "اشرافه" || command === "إشرافه") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) {
@@ -1543,7 +1540,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 8b. احميه : حماية إشراف العضو من السحب (يُرجع إشرافه ويسحب إشراف المعتدي)
+    // احميه
     if (command === "احميه" || command === "احمية") {
         if (!getMessageText(msg).trim().startsWith(".")) return;
         await deleteCommandMessage();
@@ -1597,7 +1594,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 8c. إلغاء الحماية
+    // إلغاء الحماية
     if (command === "الغاء_احميه" || command === "الغاء_حمايه" || command === "الغاء_حماية") {
         if (!getMessageText(msg).trim().startsWith(".")) return;
         await deleteCommandMessage();
@@ -1615,7 +1612,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 9. إلغاء اشرافه
+    // إلغاء اشرافه
     if (command === "الغاء_اشرافه" || command === "إلغاء_إشرافه") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1637,7 +1634,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 10. استثناء
+    // استثناء
     if (command === "استثناء") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1654,7 +1651,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 11. قفل
+    // قفل
     if (command === "قفل") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1665,7 +1662,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 12. فتح
+    // فتح
     if (command === "فتح") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1676,7 +1673,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 13. معلومات
+    // معلومات
     if (command === "معلومات") {
         await deleteCommandMessage();
         if (!isGroup || (!isOwner && !hasLocalAccess)) return;
@@ -1713,7 +1710,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 14. ترقية
+    // ترقية
     if (command === "ترقية") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1731,7 +1728,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 15. إعفاء
+    // إعفاء
     if (command === "إعفاء" || command === "اعفاء") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1754,7 +1751,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 16. تصفير
+    // تصفير
     if (command === "تصفير") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1768,7 +1765,7 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 17. إعادة ضبط المخالفات
+    // إعادة ضبط المخالفات
     if (command === "إعادة_ضبط_المخالفات" || command === "اعادة_ضبط_المخالفات") {
         await deleteCommandMessage();
         if (!isOwner && !hasLocalAccess) return;
@@ -1779,12 +1776,12 @@ async function handleCommands(ctx) {
         return;
     }
 
-    // 18. ابلاغ
+    // ابلاغ
     if (command === "ابلاغ") {
         await deleteCommandMessage();
         const reportText = args.join(" ").slice(0, 1000);
         const lastReport = reportCooldown.get(sender) || 0;
-        if (Date.now() - lastReport < 30 * 1000) return;   // منع إغراق قروب الدعم
+        if (Date.now() - lastReport < 30 * 1000) return;
         reportCooldown.set(sender, Date.now());
         if (reportCooldown.size > 2000) reportCooldown.delete(reportCooldown.keys().next().value);
         if (!reportText) {
@@ -1828,12 +1825,10 @@ async function main() {
 
         setTimeout(runCleanup, 30 * 1000);
 
-        // فحص النسخ الاحتياطي كل 30 دقيقة (يرسل فقط إذا مضت 24 ساعة على آخر نسخة، فلا يتكرر عند إعادة التشغيل)
         const backupTimer = setInterval(() => runBackupCheck().catch(() => {}), 30 * 60 * 1000);
         backupTimer.unref?.();
         setTimeout(() => runBackupCheck().catch(() => {}), 90 * 1000);
 
-        // فتح القروبات المقفلة احترازياً (يشتغل حتى بعد إعادة تشغيل البوت)
         const unlockTimer = setInterval(() => runUnlockCheck().catch(() => {}), 15 * 1000);
         unlockTimer.unref?.();
 
@@ -1848,6 +1843,7 @@ function shutdown() {
     stopWatchdog();
     if (cleanupInterval) clearInterval(cleanupInterval);
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (pairingRetryTimer) clearTimeout(pairingRetryTimer);
     saveDb();
     flushBotat();
     process.exit(0);
