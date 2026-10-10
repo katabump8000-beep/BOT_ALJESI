@@ -19,7 +19,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_FILE = path.join(__dirname, "botat-db.json");
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+const DB_FILE = path.join(DATA_DIR, "botat-db.json");
+const BOT_TZ = process.env.BOT_TZ || "Asia/Riyadh";
+
+function localHour() {
+    try {
+        const h = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: BOT_TZ }).format(new Date());
+        return parseInt(h, 10) % 24;
+    } catch {
+        return new Date().getHours();
+    }
+}
 
 // ============================================================
 // الإعدادات الافتراضية
@@ -54,6 +66,7 @@ const DEFAULT_CONFIG = {
         receiptVoid: 4,     // 6+ رسائل مرسلة وصفر إيصالات طوال اليوم (Baileys افتراضياً بلا إيصالات)
         nightOwl: 3,        // حضور متكرر أونلاين بين 3-6 فجراً
         silentWatcher: 3,   // 10+ أحداث حضور وصفر رسائل — بوت رصد/سحب صامت
+        instantOnline: 2,   // أونلاين خلال ثوانٍ من الدخول بدون أي تفاعل
         taskReplyNoType: 3, // رد "تم" خلال 1.5 ثانية بدون أي مؤشر كتابة
         quickRead1: 1,
         quickReadRepeat: 2,
@@ -69,12 +82,25 @@ let db = { config: {}, members: {}, joinLog: [], detectGroups: {}, stats: {}, li
 
 try {
     if (fs.existsSync(DB_FILE)) {
-        const parsed = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-        if (parsed && typeof parsed === "object") db = { ...db, ...parsed };
+        const raw = fs.readFileSync(DB_FILE, "utf8");
+        if (raw.trim()) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === "object") db = { ...db, ...parsed };
+            } catch (e) {
+                // لا نكتب فوق ملف تالف: نحتفظ بنسخة منه أولاً
+                try { fs.copyFileSync(DB_FILE, `${DB_FILE}.corrupt-${Date.now()}`); } catch {}
+                console.error("⚠️ botat: botat-db.json تالف، حُفظت نسخة منه وسيتم إنشاء ملف جديد.");
+            }
+        }
     }
 } catch (e) {
-    console.error("⚠️ botat: تعذر قراءة botat-db.json، سيتم إنشاء ملف جديد.");
+    console.error("⚠️ botat: تعذر قراءة botat-db.json:", e?.message);
 }
+for (const k of ["config", "members", "detectGroups", "stats", "lidMap"]) {
+    if (!db[k] || typeof db[k] !== "object") db[k] = {};
+}
+if (!Array.isArray(db.joinLog)) db.joinLog = [];
 
 function saveDb() {
     try {
@@ -84,6 +110,10 @@ function saveDb() {
     } catch (e) {
         console.error("❌ botat: خطأ حفظ القاعدة:", e?.message);
     }
+}
+
+export function flushBotat() {
+    try { saveDb(); } catch {}
 }
 
 let saveTimer = null;
@@ -110,6 +140,7 @@ let ownerNumbers = [];
 let selfNumber = "";
 const baits = new Map();
 const finalizeTimers = new Map();
+const activeScans = new Map();
 const scanCache = new Map();       // jid -> { at, result }
 const SCAN_CACHE_MS = 5 * 60 * 1000;
 const MAX_BAITS = 300;
@@ -158,8 +189,6 @@ function isExemptIn(group, jid) {
     try { return !!trustedHook(group, jid); } catch { return false; }
 }
 
-// الحل الجذري لمشكلة LID: نحاول دائماً الوصول للرقم الحقيقي
-// (تحتاج تفعيل lidMapping: true في إعدادات السوكت — انظر ملاحظات index.js)
 function resolvePhoneJid(jid) {
     const s = String(jid || "");
     if (!s.includes("@lid")) return s;
@@ -210,7 +239,7 @@ function getRecord(jid, create = true) {
 }
 
 // ============================================================
-// 📈 إحصاءات السلوك والحضور (عبر كل القروبات)
+// 📈 إحصاءات السلوك والحضور
 // ============================================================
 
 const COMPANION_MIN_MSGS = 5;
@@ -221,63 +250,19 @@ function getStats(num, create = true) {
     if (st) return st;
     if (!create) return null;
     return (db.stats[num] = {
-        d0: 0, dx: 0, w: 0, o: 0,        // أجهزة الإرسال + نمط المعرّف
-        ids: [],                          // آخر 5 معرّفات
-        msgs: 0,                          // عدد الرسائل الكلي
-        noType: 0, typed: 0,              // رسائل بلا/مع مؤشر كتابة
+        d0: 0, dx: 0, w: 0, o: 0,
+        ids: [],
+        msgs: 0,
+        noType: 0, typed: 0,
         lastTypingAt: 0,
-        intervals: [],                    // آخر 12 فاصل زمني (ذاكرة فقط)
+        intervals: [],
         lastMsgAt: 0, firstMsgAt: 0,
-        receipts: 0,                      // عدد إيصالات القراءة التي أرسلها
-        onlineEvents: 0, nightOnline: 0,  // حضور + حضور ليلي
+        receipts: 0,
+        onlineEvents: 0, nightOnline: 0,
         lastPresence: null,
         subscribedAt: 0,
         first: now, last: now
     });
-}
-
-function observeSender(num, ka) {
-    const st = getStats(num);
-    const now = Date.now();
-    if (ka.device > 0) st.dx++; else st.d0++;
-    if (/^3EB0/i.test(ka.id)) st.w++; else st.o++;
-    st.ids.push(ka.id);
-    if (st.ids.length > 5) st.ids.shift();
-    st.last = now;
-    return st;
-}
-
-// ✍️ تحليل "الكتابة": هل سبق الرسالة مؤشر composing خلال 8 ثوانٍ؟
-function observeTyping(num, msgKeyId) {
-    const st = getStats(num, false);
-    if (!st) return;
-    const now = Date.now();
-    const hadTyping = st.lastTypingAt && (now - st.lastTypingAt) < 8000;
-    if (hadTyping) { st.typed++; st.noType = 0; }
-    else { st.noType++; }
-    if (st.intervals && st.lastMsgAt && now - st.lastMsgAt < 60000) {
-        st.intervals.push(now - st.lastMsgAt);
-        if (st.intervals.length > 12) st.intervals.shift();
-    }
-    st.lastMsgAt = now;
-    if (!st.firstMsgAt) st.firstMsgAt = now;
-}
-
-// ⏱️ الإيقاع الآلي: معامل الاختلاف (CV) للفواصل الزمنية
-// البشر عشوائيون (CV مرتفع)، حلقات البوت شبه ثابتة (CV < 0.25)
-function cadenceIsMachine(st) {
-    const iv = (st.intervals || []).slice(-8);
-    if (iv.length < 6) return false;
-    const mean = iv.reduce((a, b) => a + b, 0) / iv.length;
-    if (mean < 1200 || mean > 30000) return false; // خارج النطاق = لا حكم
-    const variance = iv.reduce((a, b) => a + (b - mean) ** 2, 0) / iv.length;
-    const cv = Math.sqrt(variance) / mean;
-    return cv < 0.25;
-}
-
-function isCompanionOnly(st) {
-    return (st.dx >= COMPANION_MIN_MSGS && st.d0 === 0) ||
-           (st.w >= COMPANION_MIN_MSGS && st.o === 0);
 }
 
 function setSignal(rec, key, points, reason) {
@@ -295,38 +280,52 @@ export function classify(score) {
 
 const LEVEL_LABEL = { clear: "🟢 نظيف", review: "🟡 مراجعة", high: "🔴 شك عالٍ" };
 
-function botPercent(score) {
-    return Math.min(99, Math.round((score / cfg().thresholds.high) * 100));
-}
-
 // ============================================================
-// (الطبقة 2) 👁 الحضور والكتابة — presence.update
-// يُرسل من index.js: sock.ev.on("presence.update", ...)
+// (الطبقة 2) 👁 الحضور والكتابة — presence.update (تم دمجها وتوحيدها)
 // ============================================================
 
 export async function onPresence(sock, update) {
     try {
         if (!cfg().enabled) return;
         for (const p of update?.presences || []) {
-            const jid = resolvePhoneJid(p?.id);
+            const jid = normalizeJid(resolvePhoneJid(p?.id));
             const num = numOf(jid);
             if (!num || isExempt(jid)) continue;
+            // لا نتتبع إلا من لديه سجل فحص (حتى لا تتضخم قاعدة البيانات بكل من يظهر أونلاين)
+            if (!getRecord(jid, false) && !activeScans.has(jid)) continue;
 
             const st = getStats(num);
             const now = Date.now();
             const pres = p.lastKnownPresence;
 
+            // 1) تحديث الإحصائيات العامة
             if (pres === "composing" || pres === "recording") {
-                st.lastTypingAt = now;           // ← الذهب: البشر يكتبون قبل ما يرسلون
+                st.lastTypingAt = now;
             } else if (pres === "available") {
                 st.onlineEvents++;
-                const h = new Date().getHours();
-                if (h >= 3 && h <= 6) st.nightOnline++;   // 🌙 البومة الليلية
+                const h = localHour();
+                if (h >= 3 && h <= 6) {
+                    st.nightOnline++;
+                    const rec = getRecord(jid, false);
+                    if (rec && !rec.signals.nightOwl) {
+                        setSignal(rec, "nightOwl", cfg().points.nightOwl, `ظهر أونلاين الساعة ${h} فجراً بدون أي تفاعل — بوت متصل دائماً`);
+                    }
+                }
             }
             st.lastPresence = pres || "unavailable";
             st.last = now;
 
-            // إشارات قابلة للتفعيل فوراً
+            // 2) متابعة الفحوصات النشطة (Active Scans)
+            const scan = activeScans.get(jid);
+            if (scan && !scan.done && pres === "available") {
+                scan.presences++;
+                const rec = getRecord(jid, false);
+                if (rec && !rec.signals.instantOnline && Date.now() - scan.startedAt < 10000) {
+                    setSignal(rec, "instantOnline", cfg().points.instantOnline, "أونلاين خلال ثوانٍ من دخوله دون أي تفاعل");
+                }
+            }
+
+            // 3) إشارات المراقب الصامت
             const rec = getRecord(jid, false);
             if (rec && !rec.signals.silentWatcher && st.onlineEvents >= 10 && st.msgs === 0) {
                 setSignal(rec, "silentWatcher", cfg().points.silentWatcher,
@@ -340,18 +339,8 @@ export async function onPresence(sock, update) {
     }
 }
 
-// نطلب الاشتراك بحضور العضو الجديد فور دخوله (يتطلب أن يكون الرقم بين جهات اتصال
-// البوت أو أن يكونوا متفاعلين — نجرب وإن فشل لا ضرر)
-function watchPresence(sock, jid) {
-    try {
-        const st = getStats(numOf(jid), false);
-        if (st) st.subscribedAt = Date.now();
-        sock.presenceSubscribe?.(normalizeJid(resolvePhoneJid(jid))).catch(() => {});
-    } catch {}
-}
-
 // ============================================================
-// (الطبقة 0) الأجهزة المرتبطة - getUSyncDevices مع إعادة محاولة ذكية
+// (الطبقة 0) الأجهزة المرتبطة - getUSyncDevices
 // ============================================================
 
 function withTimeout(promise, ms) {
@@ -361,7 +350,6 @@ function withTimeout(promise, ms) {
     ]);
 }
 
-// يرجع { ok, count, devices:[ids], maxId, method, error }
 export async function getLinkedDevices(sock, memberJid) {
     const resolved = resolvePhoneJid(memberJid);
     const p = parseJid(resolved);
@@ -388,28 +376,9 @@ export async function getLinkedDevices(sock, memberJid) {
     }
 }
 
-async function scanDevices(sock, rec) {
-    const key = rec.jid;
-    const cached = scanCache.get(key);
-    let res;
-    if (cached && Date.now() - cached.at < SCAN_CACHE_MS) {
-        res = cached.result;
-    } else {
-        // إعادة محاولة حتى 3 مرات مع تراجع أسّي — الاستعلام يفشل كثيراً لحظة الدخول
-        let lastErr = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-            res = await getLinkedDevices(sock, key);
-            if (res.ok) break;
-            lastErr = res.error;
-            const wait = (/rate|overlimit|limit/i.test(lastErr || "")) ? 30000 : 4000 * (attempt + 1);
-            if (cfg().debug) console.log(`[botat] فحص ${key} فشل (محاولة ${attempt + 1}/3): ${lastErr} — انتظار ${wait}ms`);
-            await sleep(wait);
-        }
-        scanCache.set(key, { at: Date.now(), result: res });
-    }
-    rec.devices = { ok: res.ok, count: res.count, list: res.devices, maxId: res.maxId || 0, method: res.method || null, error: res.error || null, at: Date.now() };
-
+function applyDeviceSignals(rec, res) {
     const P = cfg().points;
+    rec.devices = { ok: !!res.ok, count: res.count || 0, list: res.devices || [], error: res.error || null };
     if (res.ok && res.count >= 2) {
         setSignal(rec, "linkedDevices", P.linked2, `${res.count} أجهزة مرتبطة بالرقم`);
     } else if (res.ok && res.count === 1) {
@@ -419,48 +388,16 @@ async function scanDevices(sock, rec) {
         rec.score = Object.values(rec.signals).reduce((a, s) => a + s.points, 0);
     }
 
-    // 🏛 أرشيف الأجهزة: أرقام عالية = جلسات ربط كثيرة = استضافة بوتات
     if (res.ok && res.maxId >= 15) {
         setSignal(rec, "deviceAged", P.deviceAged, `أرقام أجهزة مرتفعة (حتى device ${res.maxId}) = تاريخ ربط جلسات كثير`);
     }
     if (res.ok && res.count >= 3) {
         setSignal(rec, "multiCompanion", P.multiCompanion, `${res.count} أجهزة مرتبطة معاً`);
     }
-    return res;
 }
 
 // ============================================================
-// (2) الحضور: يجب تمرير presence.update من index.js
-// ============================================================
-
-export async function onPresence(sock, update) {
-    try {
-        if (!cfg().enabled) return;
-        for (const p of update?.presences || []) {
-            const jid = normalizeJid(resolvePhoneJid(p?.id));
-            const key = normalizeJid(jid);
-            const scan = activeScans.get(key);
-            if (!scan || scan.done) continue;
-
-            if (p.lastKnownPresence === "available") {
-                scan.presences++;
-                const h = new Date().getHours();
-                const rec = getRecord(jid, false);
-                if (rec && !rec.signals.nightOwl && h >= 3 && h <= 6) {
-                    setSignal(rec, "nightOwl", cfg().points.nightOwl, `ظهر أونلاين الساعة ${h} فجراً بدون أي تفاعل — بوت متصل دائماً`);
-                }
-                if (rec && !rec.signals.instantOnline && Date.now() - scan.startedAt < 10000) {
-                    setSignal(rec, "instantOnline", cfg().points.instantOnline, "أونلاين خلال ثوانٍ من دخوله دون أي تفاعل");
-                }
-            }
-        }
-    } catch (e) {
-        console.error("botat onPresence:", e?.message);
-    }
-}
-
-// ============================================================
-// (3) فخ الإيصال: قراءة فورية لرسالة الترحيب = قارئ آلي
+// (3) فخ الإيصال
 // ============================================================
 
 async function sendWelcomeBait(sock, memberJid) {
@@ -500,7 +437,7 @@ export async function onReceipt(sock, updates) {
 
             const rec = getRecord(reader, false);
             if (!rec) continue;
-            setSignal(rec, "quickRead", cfg().points.quickRead,
+            setSignal(rec, "quickRead", cfg().points.quickRead1,
                 `قرأ رسالة الترحيب خلال ${Math.max(0, Math.round(delay / 100) / 10)} ثانية (قارئ آلي)`);
             await evaluate(sock, rec, { final: false });
         }
@@ -510,7 +447,7 @@ export async function onReceipt(sock, updates) {
 }
 
 // ============================================================
-// ⏱ الروتين المركزي: فحص كامل خلال 60 ثانية من الدخول
+// ⏱ الروتين المركزي: فحص كامل خلال النافذة
 // ============================================================
 
 async function runJoinScan(sock, group, memberJid, addedBy) {
@@ -525,13 +462,10 @@ async function runJoinScan(sock, group, memberJid, addedBy) {
     const scan = { startedAt: Date.now(), presences: 0, done: false };
     activeScans.set(key, scan);
 
-    // 1) اشتراك الحضور فوراً (قبل كل شيء — نريد أقصى وقت مراقبة)
     try { sock.presenceSubscribe?.(normalizeJid(resolvePhoneJid(memberJid))).catch(() => {}); } catch {}
 
-    // 2) رسالة الترحيب/الطُعم (إن كان هناك قروب استقبال) — تعمل كفخ إيصال
     sendWelcomeBait(sock, memberJid).catch(() => {});
 
-    // 3) فحص الأجهزة: محاولتان داخل النافذة (0s و 25s) — نترك 10 ثوانٍ هامش قبل النهاية
     const tries = [0, 25000];
     for (const wait of tries) {
         const elapsed = Date.now() - scan.startedAt;
@@ -542,11 +476,11 @@ async function runJoinScan(sock, group, memberJid, addedBy) {
         const res = await getLinkedDevices(sock, memberJid);
         applyDeviceSignals(rec, res);
         if (cfg().debug) console.log(`[botat] فحص ${numOf(key)} في ${group}: ok=${res.ok} linked=${res.count} maxId=${res.maxId}`);
-        if (res.ok) break; // نجاح — لا داعي للمحاولة الثانية
+        if (res.ok) break;
     }
 
-    // 4) الحكم النهائي عند 60 ثانية بالضبط
-    const remaining = cfg().detectWindowMs - (Date.now() - scan.startedAt);
+    const windowMs = cfg().finalizeAfterMs || 60000;
+    const remaining = windowMs - (Date.now() - scan.startedAt);
     if (remaining > 0) await sleep(remaining);
     if (scan.done) return;
     scan.done = true;
@@ -630,10 +564,9 @@ async function evaluate(sock, rec, { final = false, group = null } = {}) {
 }
 
 // ============================================================
-// 🚨 إنذار داخل القروب المفعّل فيه .كاشف on
+// 🚨 إنذار القروب
 // ============================================================
 
-const ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 const groupQueues = new Map();
 
 function enqueue(group, fn) {
@@ -645,54 +578,6 @@ function enqueue(group, fn) {
 
 export function isDetectorOn(group) {
     return !!db.detectGroups?.[group];
-}
-
-async function alertDetected(sock, group, memberJid, reason) {
-    const rec = getRecord(memberJid);
-    if (!rec.alertedGroups) rec.alertedGroups = {};
-    if (Date.now() - (rec.alertedGroups[group] || 0) < ALERT_COOLDOWN_MS) return false;
-    rec.alertedGroups[group] = Date.now();
-    rec.status = "review";
-    saveDb();
-
-    let locked = false;
-    try { await sock.groupSettingUpdate(group, "announcement"); locked = true; } catch {}
-
-    let admins = [];
-    try {
-        const meta = await sock.groupMetadata(group);
-        admins = (meta?.participants || [])
-            .filter(p => p.admin)
-            .map(p => p.id)
-            .filter(id => numOf(id) !== selfNumber && numOf(id) !== numOf(memberJid));
-    } catch {}
-
-    const memberTag = `@${numOf(memberJid)}`;
-    const adminTags = admins.length ? admins.map(a => `@${numOf(a)}`).join(" ") : "الأدمن";
-    const lockLine = locked ? "  تم قفل شات القروب احتياطا وحذرا رجاءا" : "";
-
-    const text =
-        `*⌬━─⟐─ ⊱•┇⚠️┇•⊰ ─⟐─━⌬*\n` +
-        `═════════════\n` +
-        `📛_*تحذير هام*_⛔\n` +
-        `═════════════\n` +
-        `تم الكشف عن جهاز مرتبط / بوت لدى العضو: \n` +
-        `${memberTag}\n` +
-        `يرجى من ${adminTags}\n` +
-        `التحقق بشأن هذا العضو وعدم ادخاله اي قروب والتعامل معه..${lockLine} \n` +
-        `تعاملو معه وتحققو معه..\n` +
-        `*⌬━─⟐─ ⊱•┇☢️┇•⊰ ─⟐─━⌬*`;
-
-    try {
-        await sock.sendMessage(group, { text, mentions: [memberJid, ...admins] });
-    } catch (e) {
-        console.error("botat: فشل إرسال تحذير الكشف:", e?.message);
-    }
-
-    await notifyOwners(sock,
-        reportText(rec, `🚨 كشف: ${reason}`) + `\n📍 القروب: ${group}\n🔒 القفل: ${locked ? "تم" : "فشل (البوت غير مشرف؟)"}`
-    ).catch(() => {});
-    return true;
 }
 
 // ============================================================
@@ -740,14 +625,12 @@ export async function onParticipantsUpdate(sock, update) {
         const group = update?.id;
         if (!group) return;
 
-        // مغادرة/طرد أثناء الفحص → إلغاء الفحص
         if (update.action === "remove") {
             for (const p of update.participants || []) cancelScan(toId(p));
         }
 
         if (update.action !== "add") return;
 
-        // سجل الدخول لكل القروبات
         for (const p of update.participants || []) {
             db.joinLog.push({ group, member: normalizeJid(toId(p)), by: update.author ? normalizeJid(update.author) : null, at: Date.now() });
         }
@@ -769,8 +652,6 @@ export async function onParticipantsUpdate(sock, update) {
     }
 }
 
-// رسائل: الغرض الوحيد هنا بناء خريطة LID→رقم (إن أرسل العضو لاحقاً)
-// + احتساب إشارات لمن كان تحت الفحص وبدأ يتكلم أثناء النافذة
 export async function onMessage(sock, msg) {
     try {
         const pn = msg?.key?.participantPn || msg?.key?.remoteJidPn;
@@ -781,7 +662,6 @@ export async function onMessage(sock, msg) {
         const key = normalizeJid(sender);
         const scan = activeScans.get(key);
         if (scan && !scan.done) {
-            // بدأ يتكلم أثناء الدقيقة — لا ننتظر، نحسم فوراً بتقرير مبكر
             scan.done = true;
             activeScans.delete(key);
             const rec = getRecord(sender, false);
@@ -888,13 +768,13 @@ export async function handleBotatCommand(ctx) {
         const sus = Object.values(db.members).filter(m => classify(m.score) !== "clear").length;
         const scanning = activeScans.size;
         return reply(
-            `🕵️ *حالة الكاشف*\n` +
+            `🕵️️ *حالة الكاشف*\n` +
             `التشغيل العام: ${c.enabled ? "✅" : "❌"}\n` +
             `الكشف في هذا القروب: ${isGroup && isDetectorOn(jid) ? "✅" : "❌"} | قروبات مفعّلة: ${Object.keys(db.detectGroups || {}).length}\n` +
             `الاستقبال: ${c.receptionGroup ? "معيّن" : "غير معيّن"}\n` +
             `الأساسي: ${c.mainGroup ? "معيّن" : "غير معيّن"}\n` +
             `قبول تلقائي: ${c.autoAdmit ? "نعم" : "لا"}\n` +
-            `نافذة الفحص: ${c.detectWindowMs / 1000} ثانية\n` +
+            `نافذة الفحص: ${(c.finalizeAfterMs || 300000) / 1000} ثانية\n` +
             `فحوصات جارية الآن: ${scanning}\n` +
             `أعضاء مفحوصون: ${total} | مشتبه بهم: ${sus}\n` +
             `خريطة LID محلولة: ${Object.keys(db.lidMap || {}).length}`
@@ -952,6 +832,18 @@ export function cleanupBotat() {
         const now = Date.now();
         for (const [id, b] of baits) if (now - b.sentAt > 60 * 60 * 1000) baits.delete(id);
         for (const [k, v] of scanCache) if (now - v.at > SCAN_CACHE_MS) scanCache.delete(k);
-        for (const [k, s] of activeScans) if (now - s.startedAt > cfg().detectWindowMs + 30000) activeScans.delete(k);
+        for (const [k, s] of activeScans) if (now - s.startedAt > (cfg().finalizeAfterMs || 300000) + 30000) activeScans.delete(k);
+
+        // منع تضخم قاعدة البيانات
+        const WEEK = 7 * 24 * 60 * 60 * 1000;
+        for (const k of Object.keys(db.stats || {})) {
+            if (now - (db.stats[k]?.last || 0) > WEEK) delete db.stats[k];
+        }
+        const members = Object.entries(db.members || {});
+        if (members.length > 5000) {
+            members.sort((a, b) => (a[1]?.joinedAt || 0) - (b[1]?.joinedAt || 0));
+            for (const [k] of members.slice(0, members.length - 5000)) delete db.members[k];
+        }
+        saveDbSoon();
     } catch {}
 }

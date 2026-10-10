@@ -1,14 +1,16 @@
 {
   "name": "bot-aljesi",
-  "version": "1.0.0",
+  "version": "1.0.1",
+  "private": true,
   "description": "BOT ALJESI WhatsApp Bot",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js && node --check botat.js && node --check haolk.js && node --check trim.js && node --check dark.js && node --check decor.js"
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=20"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.9",

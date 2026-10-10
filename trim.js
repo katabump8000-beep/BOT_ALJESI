@@ -24,6 +24,8 @@ const BAD_WORDS = [
     "نياك", "نايكك", "تلحس", "تلحسي", "تمص", "تمصلي", "ابوسك", "يلعن", "يلعن دين"
 ];
 
+const LINK_REGEX = /(https?:\/\/|www\.|chat\.whatsapp\.com\/|wa\.me\/|whatsapp\.com\/channel\/|t\.me\/|discord\.gg\/)/i;
+
 const FORBIDDEN_EMOJIS = ["💩", "🖕", "👙", "💋", "👄", "🫦"];
 
 // ============================================================
@@ -37,10 +39,21 @@ const STICKER_MAX_COUNT = 4;             // 📊 الحد الأقصى: 4 ملص
 // أدوات
 // ============================================================
 
+// تطبيع النص: يشيل التشكيل والتطويل والرموز الخفية والترقيم ويوحّد الألف/الياء
 function cleanText(text) {
     if (!text) return "";
-    return text.replace(/[\u064B-\u065F\u0670]/g, "").toLowerCase().trim();
+    return String(text)
+        .normalize("NFKC")
+        .replace(/[\u064B-\u065F\u0670\u0640\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, "")
+        .replace(/[أإآٱ]/g, "ا")
+        .replace(/ى/g, "ي")
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 }
+
+const BAD_WORDS_NORM = [...new Set(BAD_WORDS.map(cleanText).filter(Boolean))];
 
 function normalizeFilters(filtersObj) {
     const defaults = {
@@ -74,21 +87,16 @@ function checkSpamAndViolations(sock, jid, sender, msg, mText, mContent, filters
     const filters = normalizeFilters(filtersObj);
     const cleaned = cleanText(mText);
 
-    // 1. الروابط
-    if (filters.link && mText && (
-        mText.includes("http://") ||
-        mText.includes("https://") ||
-        mText.includes("chat.whatsapp.com/") ||
-        mText.includes("wa.me/")
-    )) {
+    // 1. الروابط (غير حساسة لحالة الأحرف)
+    if (filters.link && mText && LINK_REGEX.test(String(mText).normalize("NFKC"))) {
         return "ارسالك رابط";
     }
 
-    // 2. الكلمات المحظورة
+    // 2. الكلمات المحظورة (تدعم العبارات المتعددة الكلمات)
     if (filters.badword && cleaned) {
-        const words = cleaned.split(/\s+/);
-        for (const word of words) {
-            if (BAD_WORDS.includes(word)) {
+        const padded = ` ${cleaned} `;
+        for (const bw of BAD_WORDS_NORM) {
+            if (padded.includes(` ${bw} `)) {
                 return "ارسلت كلمة تسيء سمعة القروب";
             }
         }
@@ -114,9 +122,10 @@ function checkSpamAndViolations(sock, jid, sender, msg, mText, mContent, filters
     // 5. الصور المتتالية
     if (filters.image && mContent && mContent.imageMessage) {
         if (!global.userImages) global.userImages = {};
-        if (!global.userImages[sender]) global.userImages[sender] = { count: 0, updatedAt: Date.now() };
+        const imgKey = `${jid}|${sender}`;
+        if (!global.userImages[imgKey]) global.userImages[imgKey] = { count: 0, updatedAt: Date.now() };
 
-        const entry = global.userImages[sender];
+        const entry = global.userImages[imgKey];
         if (Date.now() - entry.updatedAt > 60 * 1000) entry.count = 0;
         entry.count++;
         entry.updatedAt = Date.now();
@@ -133,14 +142,15 @@ function checkSpamAndViolations(sock, jid, sender, msg, mText, mContent, filters
     // 📌 القاعدة الجديدة: 4 ملصقات خلال 8 ثواني = مخالفة
     if (filters.sticker && mContent && mContent.stickerMessage) {
         if (!global.userStickers) global.userStickers = {};
-        if (!global.userStickers[sender]) {
-            global.userStickers[sender] = {
+        const stkKey = `${jid}|${sender}`;
+        if (!global.userStickers[stkKey]) {
+            global.userStickers[stkKey] = {
                 timestamps: [],
                 updatedAt: Date.now()
             };
         }
 
-        const entry = global.userStickers[sender];
+        const entry = global.userStickers[stkKey];
         const now = Date.now();
 
         // إزالة الطوابع الزمنية القديمة (التي مضى عليها أكثر من 8 ثواني)
@@ -223,10 +233,14 @@ function cleanupMemory() {
 
 const protectedAdmins = {};
 
+function pKey(jid) {
+    return String(jid || "").split("@")[0].split(":")[0];
+}
+
 function addProtectedAdmin(jid, memberJid, addedBy) {
     if (!jid || !memberJid) return false;
     if (!protectedAdmins[jid]) protectedAdmins[jid] = {};
-    protectedAdmins[jid][memberJid] = {
+    protectedAdmins[jid][pKey(memberJid)] = {
         addedBy,
         addedAt: Date.now(),
         locked: true
@@ -236,8 +250,9 @@ function addProtectedAdmin(jid, memberJid, addedBy) {
 
 function removeProtectedAdmin(jid, memberJid) {
     if (!protectedAdmins[jid]) return false;
-    if (protectedAdmins[jid][memberJid]) {
-        delete protectedAdmins[jid][memberJid];
+    const k = pKey(memberJid);
+    if (protectedAdmins[jid][k]) {
+        delete protectedAdmins[jid][k];
         if (Object.keys(protectedAdmins[jid]).length === 0) {
             delete protectedAdmins[jid];
         }
@@ -247,7 +262,7 @@ function removeProtectedAdmin(jid, memberJid) {
 }
 
 function isProtectedAdmin(jid, memberJid) {
-    return !!(protectedAdmins[jid] && protectedAdmins[jid][memberJid]);
+    return !!(protectedAdmins[jid] && protectedAdmins[jid][pKey(memberJid)]);
 }
 
 function getProtectedAdmins(jid) {

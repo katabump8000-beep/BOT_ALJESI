@@ -236,12 +236,7 @@ async function postStrike(sock, jid, who, senderRaw, rec, hooks) {
             `${DECOR.bottomEm}`
     }).catch(() => {});
 
-    setTimeout(async () => {
-        try {
-            await sock.groupSettingUpdate(jid, "not_announcement");
-            await sock.sendMessage(jid, { text: decorateLock(false) }).catch(() => {});
-        } catch {}
-    }, LOCK_REOPEN_MS);
+    scheduleReopen(sock, jid, LOCK_REOPEN_MS, hooks);
 
     // 📋 استمارة القائمة (.قائمة on) + الرد عليها بـ .مؤبد
     try {
@@ -260,7 +255,21 @@ function cleanupPunished() {
     for (const [k, v] of punished) if (v.until < now) punished.delete(k);
 }
 
-async function handleAntiLeaveZzs(sock, update) {
+// فتح القروب بعد القفل: يُسجَّل في قاعدة البيانات (حتى لا يبقى القروب مقفلاً إذا أُعيد تشغيل البوت)
+function scheduleReopen(sock, jid, ms, hooks = {}) {
+    if (typeof hooks.scheduleUnlock === "function") {
+        hooks.scheduleUnlock(jid, ms);
+        return;
+    }
+    setTimeout(async () => {
+        try {
+            await sock.groupSettingUpdate(jid, "not_announcement");
+            await sock.sendMessage(jid, { text: decorateLock(false) }).catch(() => {});
+        } catch {}
+    }, ms);
+}
+
+async function handleAntiLeaveZzs(sock, update, hooks = {}) {
     const { id: jid, action, participants } = update || {};
     if (action !== "remove") return;
 
@@ -269,12 +278,14 @@ async function handleAntiLeaveZzs(sock, update) {
 
     try {
         if (recentMessages[jid]) {
-            const userMsgs = recentMessages[jid].filter(m => m.sender === leaver).slice(-15);
-            for (const m of userMsgs) {
-                try { await sock.sendMessage(jid, { delete: m.msgKey }); } catch {}
-            }
+            const leaverKey = normJid(leaver);
+            const userMsgs = recentMessages[jid].filter(m => normJid(m.sender) === leaverKey).slice(-15);
             const last10 = recentMessages[jid].slice(-10);
-            for (const m of last10) {
+            const seen = new Set();
+            for (const m of [...userMsgs, ...last10]) {
+                const id = m.msgKey?.id;
+                if (!id || seen.has(id)) continue;   // لا نحذف نفس الرسالة مرتين
+                seen.add(id);
                 try { await sock.sendMessage(jid, { delete: m.msgKey }); } catch {}
             }
         }
@@ -295,12 +306,7 @@ async function handleAntiLeaveZzs(sock, update) {
                 `${DECOR.topEm}`
         }).catch(() => {});
 
-        setTimeout(async () => {
-            try {
-                await sock.groupSettingUpdate(jid, "not_announcement");
-                await sock.sendMessage(jid, { text: decorateLock(false) }).catch(() => {});
-            } catch {}
-        }, 3 * 60 * 1000);
+        scheduleReopen(sock, jid, 3 * 60 * 1000, hooks);
 
     } catch (e) {
         console.error("خطأ في معالجة مغادرة العضو:", e?.message);

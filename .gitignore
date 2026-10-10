@@ -1,0 +1,8 @@
+node_modules/
+session/
+database.json
+botat-db.json
+*.tmp
+*.log
+.env
+.DS_Store
