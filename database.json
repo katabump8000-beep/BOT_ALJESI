@@ -1,1 +1,256 @@
-{}
+{
+  "authorizedUsers": {},
+  "globalAuthorized": {
+    "69832192045113@lid": true,
+    "127097511100664@lid": true,
+    "1954763767962@lid": true,
+    "110591767273686@lid": true
+  },
+  "groupSettings": {
+    "235639840735456@lid": {
+      "protection": false,
+      "leave": false,
+      "monitoring": false,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": false,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363428430538684@g.us": {
+      "protection": false,
+      "leave": false,
+      "monitoring": true,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": false,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363428593920575@g.us": {
+      "protection": false,
+      "leave": false,
+      "monitoring": false,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": false,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363412416383659@g.us": {
+      "protection": true,
+      "leave": false,
+      "monitoring": true,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": true,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363430725714297@g.us": {
+      "protection": true,
+      "leave": false,
+      "monitoring": true,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": true,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363414055337881@g.us": {
+      "protection": true,
+      "leave": true,
+      "monitoring": true,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": true,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363413769708050@g.us": {
+      "protection": true,
+      "leave": true,
+      "monitoring": true,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": true,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363411314348837@g.us": {
+      "protection": true,
+      "leave": false,
+      "monitoring": false,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": true,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "120363432090935034@g.us": {
+      "protection": true,
+      "leave": true,
+      "monitoring": true,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": true,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "status@broadcast": {
+      "protection": false,
+      "leave": false,
+      "monitoring": false,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": false,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    },
+    "110591767273686@lid": {
+      "protection": false,
+      "leave": false,
+      "monitoring": false,
+      "emoji": false,
+      "antiMention": false,
+      "antiZarf": false,
+      "supportActive": false,
+      "filters": {
+        "link": true,
+        "badword": true,
+        "image": true,
+        "sticker": true,
+        "lang": true,
+        "emoji": true
+      }
+    }
+  },
+  "reportGroup": null,
+  "blacklistGroups": [
+    "120363428593920575@g.us"
+  ],
+  "exceptions": {
+    "120363428430538684@g.us": {
+      "127097511100664@lid": true,
+      "69403148329086@lid": true,
+      "135215032877087@lid": true,
+      "1954763767962@lid": true,
+      "110591767273686@lid": true,
+      "231357791907855@lid": true
+    },
+    "120363430725714297@g.us": {
+      "71322965151807@lid": true,
+      "132817887441116@lid": true
+    },
+    "120363412416383659@g.us": {
+      "71322965151807@lid": true,
+      "135215032877087@lid": true
+    },
+    "120363413769708050@g.us": {
+      "41030460129474@lid": true
+    },
+    "120363411314348837@g.us": {
+      "41030460129474@lid": true
+    },
+    "120363414055337881@g.us": {
+      "231357791907855@lid": true
+    }
+  },
+  "backupGroups": {
+    "120363428593920575@g.us": true
+  },
+  "lastBackupAt": {
+    "120363428593920575@g.us": 1791323942647
+  },
+  "protectedMembers": {
+    "120363428430538684@g.us": {
+      "69403148329086@lid": {
+        "addedBy": "127097511100664@lid",
+        "addedAt": 1791240664729
+      }
+    },
+    "120363412416383659@g.us": {
+      "69403148329086@lid": {
+        "addedBy": "127097511100664@lid",
+        "addedAt": 1791240937873
+      }
+    },
+    "120363430725714297@g.us": {
+      "69403148329086@lid": {
+        "addedBy": "48450413480@s.whatsapp.net",
+        "addedAt": 1791241166661
+      }
+    }
+  },
+  "pendingUnlocks": {}
+}
